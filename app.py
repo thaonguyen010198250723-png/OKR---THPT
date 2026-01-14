@@ -100,7 +100,7 @@ def init_and_migrate_db():
             c.execute("ALTER TABLE OKRs ADD COLUMN Unit TEXT DEFAULT ''")
         except: pass
         try:
-            c.execute("ALTER TABLE OKRs ADD COLUMN DeleteRequest INTEGER DEFAULT 0") -- 0: Không, 1: Có
+            c.execute("ALTER TABLE OKRs ADD COLUMN DeleteRequest INTEGER DEFAULT 0") # 0: Không, 1: Có
         except: pass
 
         # 6. Bảng FinalReviews (MỚI): Lưu nhận xét cuối kỳ duy nhất
