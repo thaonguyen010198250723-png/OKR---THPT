@@ -11,7 +11,7 @@ import time
 # CẤU HÌNH TRANG & GIAO DIỆN (THEME)
 # ==============================================================================
 st.set_page_config(
-    page_title="Hệ thống Quản lý OKR Trường học (GSheets V2)",
+    page_title="Hệ thống Quản lý OKR Trường học (GSheets V2 Fixed)",
     page_icon="🎓",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -49,11 +49,15 @@ SHEET_ID = "14E2JfVyOhGMa7T1VA44F31IaPMWIVIPRApo4B-ipDLk"
 @st.cache_resource
 def init_connection():
     """Khởi tạo kết nối đến Google Sheets"""
-    scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-    creds_dict = json.loads(st.secrets["service_account"]["info"])
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    client = gspread.authorize(creds)
-    return client
+    try:
+        scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+        creds_dict = json.loads(st.secrets["service_account"]["info"])
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        client = gspread.authorize(creds)
+        return client
+    except Exception as e:
+        st.error(f"Lỗi kết nối Google Sheets: {e}")
+        return None
 
 def get_worksheet(sheet_name):
     """Lấy worksheet, nếu chưa có thì tạo mới"""
@@ -65,10 +69,10 @@ def get_worksheet(sheet_name):
         ws = sh.add_worksheet(title=sheet_name, rows=100, cols=20)
         # Header cập nhật: Bỏ ClassID/ID, dùng TenLop
         if sheet_name == "Users":
-            ws.append_row(["Email", "Password", "HoTen", "VaiTro", "TenLop"]) # Thay ClassID bằng TenLop
+            ws.append_row(["Email", "Password", "HoTen", "VaiTro", "TenLop"])
             ws.append_row(["admin@school.com", "123", "Quản Trị Viên", "Admin", ""])
         elif sheet_name == "Classes":
-            ws.append_row(["TenLop", "EmailGVCN", "SiSo"]) # Bỏ cột ID
+            ws.append_row(["TenLop", "EmailGVCN", "SiSo"]) 
         elif sheet_name == "Periods":
             ws.append_row(["ID", "TenDot", "TrangThai"])
         elif sheet_name == "Relationships":
@@ -83,11 +87,27 @@ def get_worksheet(sheet_name):
 
 @st.cache_data(ttl=10)
 def load_data(sheet_name):
-    """Đọc dữ liệu"""
+    """Đọc dữ liệu và xử lý tương thích cột cũ/mới"""
     ws = get_worksheet(sheet_name)
     data = ws.get_all_records()
     df = pd.DataFrame(data)
     
+    # --- FIX LỖI KEY ERROR ---
+    # Nếu bảng Users có cột 'ClassID' (cũ), đổi tên nó thành 'TenLop' (mới)
+    if sheet_name == "Users":
+        if 'ClassID' in df.columns and 'TenLop' not in df.columns:
+            df = df.rename(columns={'ClassID': 'TenLop'})
+        # Nếu vẫn không có TenLop, tạo cột rỗng để tránh lỗi
+        if 'TenLop' not in df.columns:
+            df['TenLop'] = ""
+
+    # Nếu bảng Classes có cột 'ID' (cũ) mà không dùng, vẫn giữ logic đọc cột TenLop
+    if sheet_name == "Classes":
+        if 'TenLop' not in df.columns and 'ID' in df.columns:
+             # Trường hợp dữ liệu cũ, Classes dùng ID làm tên lớp
+             df['TenLop'] = df['ID']
+
+    # --- Xử lý kiểu dữ liệu ---
     if sheet_name == "OKRs" and not df.empty:
         df['ID'] = pd.to_numeric(df['ID'], errors='coerce')
         df['ID_Dot'] = pd.to_numeric(df['ID_Dot'], errors='coerce')
@@ -112,16 +132,33 @@ def update_record(sheet_name, match_col, match_val, update_col, update_val, matc
     ws = get_worksheet(sheet_name)
     try:
         cell = None
+        # Logic map tên cột cũ sang mới khi UPDATE
+        real_match_col = match_col
+        if sheet_name == "Users" and match_col == "TenLop":
+            # Kiểm tra xem sheet thật sự có cột TenLop hay ClassID
+            headers = ws.row_values(1)
+            if "ClassID" in headers and "TenLop" not in headers:
+                real_match_col = "ClassID"
+
         if match_col_2:
             records = ws.get_all_records()
             for i, r in enumerate(records):
-                if str(r[match_col]) == str(match_val) and str(r[match_col_2]) == str(match_val_2):
+                # Lưu ý: r keys sẽ là header thực tế của sheet
+                val1 = str(r.get(real_match_col, r.get(match_col, '')))
+                val2 = str(r.get(match_col_2, ''))
+                
+                if val1 == str(match_val) and val2 == str(match_val_2):
                     row_idx = i + 2
                     col_idx = ws.find(update_col).col
                     ws.update_cell(row_idx, col_idx, update_val)
                     break
         else:
-            cell = ws.find(str(match_val), in_column=ws.find(match_col).col)
+            # Tìm cột match
+            find_col = ws.find(real_match_col)
+            if not find_col: # Fallback nếu không tìm thấy cột
+                return
+                
+            cell = ws.find(str(match_val), in_column=find_col.col)
             if cell:
                 col_idx = ws.find(update_col).col
                 ws.update_cell(cell.row, col_idx, update_val)
@@ -217,16 +254,21 @@ def login_page():
         submitted = st.form_submit_button("Đăng nhập")
         if submitted:
             df_users = load_data("Users")
-            user = df_users[(df_users['Email'] == email) & (df_users['Password'].astype(str) == str(password))]
+            # Convert to string to ensure matching
+            df_users['Password'] = df_users['Password'].astype(str)
+            
+            user = df_users[(df_users['Email'] == email) & (df_users['Password'] == str(password))]
             
             if not user.empty:
                 u = user.iloc[0]
-                # Lưu tên lớp vào session state thay vì ID
+                # Fix lỗi KeyError: Dùng .get để an toàn nếu cột TenLop chưa tồn tại
+                ten_lop_val = u.get('TenLop', '')
+                
                 st.session_state['user'] = {
                     'email': u['Email'], 
                     'name': u['HoTen'], 
                     'role': u['VaiTro'], 
-                    'ten_lop': u['TenLop'] # Changed from ClassID
+                    'ten_lop': ten_lop_val
                 }
                 st.rerun()
             else:
@@ -257,7 +299,9 @@ def admin_dashboard(period_id):
                 ten_lop = cl['TenLop']
                 
                 # Lọc HS theo Tên Lớp
-                class_users = all_users[all_users['TenLop'] == ten_lop]['Email'].tolist()
+                class_users = []
+                if not all_users.empty and 'TenLop' in all_users.columns:
+                    class_users = all_users[all_users['TenLop'] == ten_lop]['Email'].tolist()
                 
                 if not reviews.empty and class_users:
                     approved_count = reviews[
@@ -290,19 +334,13 @@ def admin_dashboard(period_id):
                 if st.form_submit_button("Tạo Lớp"):
                     if c_name and c_gv:
                         try:
-                            # Kiểm tra lớp tồn tại
-                            if not classes.empty and c_name in classes['TenLop'].values:
+                            if not classes.empty and 'TenLop' in classes.columns and c_name in classes['TenLop'].values:
                                 st.error("Tên lớp đã tồn tại!")
                             else:
-                                # Thêm lớp: TenLop, EmailGVCN, SiSo
                                 add_record("Classes", [c_name, c_gv, c_siso])
-                                
-                                # Check GV exist
                                 users = load_data("Users")
-                                if users[users['Email'] == c_gv].empty:
-                                    # Thêm GV, TenLop để trống (GV không thuộc lớp nào để học)
+                                if users.empty or users[users['Email'] == c_gv].empty:
                                     add_record("Users", [c_gv, "123", f"GV ({c_name})", "GiaoVien", ""])
-                                    
                                 st.success(f"Đã tạo lớp {c_name}!")
                                 st.rerun()
                         except Exception as e:
@@ -361,7 +399,6 @@ def teacher_dashboard(period_id):
     change_password_ui(user_email)
     
     classes = load_data("Classes")
-    # Tìm lớp theo Email GVCN
     my_class = classes[classes['EmailGVCN'] == user_email]
     
     if my_class.empty:
@@ -377,8 +414,9 @@ def teacher_dashboard(period_id):
         st.subheader("📋 Trạng thái OKR Học sinh")
         
         users = load_data("Users")
-        # Lọc HS theo TenLop
-        students = users[users['TenLop'] == class_name]
+        students = pd.DataFrame()
+        if 'TenLop' in users.columns:
+            students = users[users['TenLop'] == class_name]
         
         if students.empty:
             st.write("Lớp chưa có học sinh.")
@@ -518,7 +556,7 @@ def teacher_dashboard(period_id):
                 all_rels = load_data("Relationships")
                 
                 for _, r in df.iterrows():
-                    # Thêm HS (Dùng class_name thay vì ID)
+                    # Thêm HS
                     if all_users.empty or r['Email'] not in all_users['Email'].values:
                          add_record("Users", [r['Email'], '123', r['HoTen'], 'HocSinh', class_name])
 
