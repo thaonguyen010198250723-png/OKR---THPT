@@ -9,7 +9,7 @@ import time
 # CẤU HÌNH TRANG & GIAO DIỆN (THEME)
 # ==============================================================================
 st.set_page_config(
-    page_title="Hệ thống Quản lý OKR Trường học (V4)",
+    page_title="Hệ thống Quản lý OKR Trường học (V5)",
     page_icon="🎓",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -372,9 +372,6 @@ def teacher_dashboard(period_id):
             
             for idx, hs in students.iterrows():
                 # Logic xác định trạng thái Lần 1 (Mục tiêu)
-                # - Chưa tạo -> Đỏ
-                # - Có item chưa duyệt -> Vàng
-                # - Đã duyệt hết -> Xanh
                 okrs = pd.read_sql("SELECT TrangThai, DeleteRequest FROM OKRs WHERE Email_HocSinh=? AND ID_Dot=?", conn, params=(hs['Email'], period_id))
                 
                 l1_status = ""
@@ -393,7 +390,6 @@ def teacher_dashboard(period_id):
                         l1_badge = "badge-green"
 
                 # Logic xác định trạng thái Lần 2 (Tổng kết)
-                # Check bảng FinalReviews
                 fr = pd.read_sql("SELECT * FROM FinalReviews WHERE Email_HocSinh=? AND ID_Dot=? AND NhanXet_GV IS NOT NULL AND NhanXet_GV != ''", 
                                          conn, params=(hs['Email'], period_id))
                 has_final_review = not fr.empty
@@ -436,7 +432,6 @@ def teacher_dashboard(period_id):
                         with st.container(border=True):
                             c1, c2, c3 = st.columns([4, 2, 2])
                             
-                            # Hiển thị yêu cầu xóa nếu có
                             bg_color = ""
                             if row['DeleteRequest'] == 1:
                                 st.error(f"⚠️ Học sinh yêu cầu xóa mục tiêu: {row['MucTieu']} - {row['KetQuaThenChot']}")
@@ -465,17 +460,36 @@ def teacher_dashboard(period_id):
                                         conn.commit()
                                         st.rerun()
 
-                    # Duyệt Tổng Kết (Lần 2)
+                    # Duyệt Tổng Kết (Lần 2) & Xem ý kiến gia đình
                     st.write("---")
-                    st.write("**Đánh giá cuối kỳ (Final Review):**")
-                    fr = pd.read_sql("SELECT * FROM FinalReviews WHERE Email_HocSinh=? AND ID_Dot=?", conn, params=(hs_curr['Email'], period_id))
-                    old_cmt = fr.iloc[0]['NhanXet_GV'] if not fr.empty else ""
                     
+                    fr = pd.read_sql("SELECT * FROM FinalReviews WHERE Email_HocSinh=? AND ID_Dot=?", conn, params=(hs_curr['Email'], period_id))
+                    old_cmt_gv = fr.iloc[0]['NhanXet_GV'] if not fr.empty else ""
+                    cmt_ph = fr.iloc[0]['NhanXet_PH'] if not fr.empty else None
+                    
+                    # Hiển thị Ý kiến gia đình
+                    if cmt_ph:
+                        st.info(f"🏠 **Ý kiến gia đình:** {cmt_ph}")
+                    else:
+                        st.caption("🏠 Gia đình chưa gửi ý kiến.")
+
+                    # Form GV nhập nhận xét
+                    st.write("**Đánh giá cuối kỳ (Final Review):**")
                     with st.form("teacher_review"):
-                        cmt = st.text_area("Nhận xét giáo viên:", value=old_cmt)
+                        cmt = st.text_area("Nhận xét giáo viên:", value=old_cmt_gv)
                         if st.form_submit_button("Lưu & Hoàn tất Duyệt Lần 2"):
                             conn.execute("INSERT OR REPLACE INTO FinalReviews (Email_HocSinh, ID_Dot, NhanXet_GV) VALUES (?,?,?)",
                                          (hs_curr['Email'], period_id, cmt))
+                            # Giữ lại NhanXet_PH nếu có (logic REPLACE của SQLite có thể xóa cột khác nếu không khai báo đủ)
+                            # Nên dùng UPDATE hoặc INSERT OR IGNORE + UPDATE
+                            # Safe Update Logic:
+                            cursor = conn.cursor()
+                            cursor.execute("SELECT 1 FROM FinalReviews WHERE Email_HocSinh=? AND ID_Dot=?", (hs_curr['Email'], period_id))
+                            if cursor.fetchone():
+                                conn.execute("UPDATE FinalReviews SET NhanXet_GV=? WHERE Email_HocSinh=? AND ID_Dot=?", (cmt, hs_curr['Email'], period_id))
+                            else:
+                                conn.execute("INSERT INTO FinalReviews (Email_HocSinh, ID_Dot, NhanXet_GV) VALUES (?,?,?)", (hs_curr['Email'], period_id, cmt))
+                                
                             conn.commit()
                             st.success("Đã lưu nhận xét!")
 
@@ -488,8 +502,10 @@ def teacher_dashboard(period_id):
                 df = pd.read_excel(upl)
                 count = 0
                 for _, r in df.iterrows():
+                    # Thêm HS
                     conn.execute("INSERT OR IGNORE INTO Users (Email, Password, HoTen, VaiTro, ClassID) VALUES (?,?,?,?,?)",
                                  (r['Email'], '123', r['HoTen'], 'HocSinh', class_id))
+                    # Thêm PH
                     if pd.notna(r['EmailPH']):
                         conn.execute("INSERT OR IGNORE INTO Users (Email, Password, HoTen, VaiTro) VALUES (?,?,'Phụ Huynh','PhuHuynh')",
                                      (str(r['EmailPH']), '123'))
@@ -529,7 +545,7 @@ def student_dashboard(period_id):
                     st.success("Đã thêm!")
                     st.rerun()
 
-    # 2. HIỂN THỊ
+    # 2. HIỂN THỊ (GROUP BY OBJECTIVE)
     st.divider()
     st.subheader("📋 OKR của tôi")
     
@@ -538,12 +554,16 @@ def student_dashboard(period_id):
     if df_okrs.empty:
         st.info("Chưa có dữ liệu.")
     else:
+        # Group by Objective
         unique_objs = df_okrs['MucTieu'].unique()
+        
         total_pct = 0
         count_kr = 0
         
         for obj in unique_objs:
             st.markdown(f"#### 🎯 O: {obj}")
+            
+            # Get KRs for this Objective
             krs = df_okrs[df_okrs['MucTieu'] == obj]
             
             for _, row in krs.iterrows():
@@ -564,6 +584,7 @@ def student_dashboard(period_id):
                     c2.metric("Tiến độ", f"{row['ActualValue']} / {row['TargetValue']} {row['Unit']}")
                     c2.progress(min(pct/100, 1.0))
                     
+                    # Update Result Popover
                     with c3:
                         with st.popover("Báo cáo KQ"):
                             with st.form(f"upd_{row['ID']}"):
@@ -573,24 +594,45 @@ def student_dashboard(period_id):
                                     conn.commit()
                                     st.rerun()
                     
+                    # Delete Request
                     with c4:
-                        # Nút xóa luôn gửi yêu cầu
-                        if row['DeleteRequest'] == 0:
-                            if st.button("🗑️ Xin xóa", key=f"req_{row['ID']}"):
-                                conn.execute("UPDATE OKRs SET DeleteRequest=1 WHERE ID=?", (row['ID'],))
+                        if row['TrangThai'] == 'ChoDuyet':
+                            if st.button("🗑️", key=f"del_{row['ID']}"):
+                                conn.execute("DELETE FROM OKRs WHERE ID=?", (row['ID'],))
                                 conn.commit()
                                 st.rerun()
                         else:
-                            st.caption("⏳ Đợi duyệt")
+                            if row['DeleteRequest'] == 0:
+                                if st.button("Xin xóa", key=f"req_{row['ID']}"):
+                                    conn.execute("UPDATE OKRs SET DeleteRequest=1 WHERE ID=?", (row['ID'],))
+                                    conn.commit()
+                                    st.rerun()
+                            else:
+                                st.caption("Đang chờ xóa")
 
+        # 3. TỔNG KẾT
         st.divider()
         final_score = round(total_pct / count_kr, 1) if count_kr > 0 else 0
         rank, color = get_rank(final_score)
         st.markdown(f"### 🏁 Tổng kết: <span style='color:{color}'>{final_score}% - {rank}</span>", unsafe_allow_html=True)
         
+        # Xem Nhận xét (GV & PH)
         fr = pd.read_sql("SELECT * FROM FinalReviews WHERE Email_HocSinh=? AND ID_Dot=?", conn, params=(user_email, period_id))
-        if not fr.empty:
-            st.info(f"👨‍🏫 Giáo viên nhận xét: {fr.iloc[0]['NhanXet_GV']}")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("##### 👨‍🏫 Giáo viên nhận xét:")
+            if not fr.empty and fr.iloc[0]['NhanXet_GV']:
+                st.info(fr.iloc[0]['NhanXet_GV'])
+            else:
+                st.caption("Chưa có nhận xét.")
+
+        with col2:
+            st.markdown("##### 🏠 Gia đình nhận xét:")
+            if not fr.empty and fr.iloc[0]['NhanXet_PH']:
+                st.success(fr.iloc[0]['NhanXet_PH'])
+            else:
+                st.caption("Gia đình chưa có ý kiến.")
 
     conn.close()
 
@@ -611,6 +653,7 @@ def parent_dashboard(period_id):
     child_info = pd.read_sql("SELECT HoTen, ClassID FROM Users WHERE Email=?", conn, params=(child_email,))
     st.info(f"Con: {child_info.iloc[0]['HoTen']} - Lớp: {child_info.iloc[0]['ClassID']}")
     
+    # Hiển thị OKR
     df_okr = pd.read_sql("SELECT * FROM OKRs WHERE Email_HocSinh=? AND ID_Dot=?", conn, params=(child_email, period_id))
     
     if df_okr.empty:
@@ -629,6 +672,7 @@ def parent_dashboard(period_id):
         r, c = get_rank(avg)
         st.markdown(f"#### Tổng kết: <span style='color:{c}'>{avg}% ({r})</span>", unsafe_allow_html=True)
         
+        # Nhận xét
         st.divider()
         col1, col2 = st.columns(2)
         fr = pd.read_sql("SELECT * FROM FinalReviews WHERE Email_HocSinh=? AND ID_Dot=?", conn, params=(child_email, period_id))
@@ -651,6 +695,7 @@ def parent_dashboard(period_id):
                 with st.form("ph_cmt"):
                     txt = st.text_area("Ý kiến:", value=cmt_ph)
                     if st.form_submit_button("Gửi"):
+                        # Insert/Update logic safe
                         cursor = conn.cursor()
                         cursor.execute("SELECT 1 FROM FinalReviews WHERE Email_HocSinh=? AND ID_Dot=?", (child_email, period_id))
                         if cursor.fetchone():
