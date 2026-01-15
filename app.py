@@ -62,6 +62,8 @@ def init_connection():
 def get_worksheet(sheet_name):
     """Lấy worksheet, nếu chưa có thì tạo mới"""
     client = init_connection()
+    if not client: return None
+    
     sh = client.open_by_key(SHEET_ID)
     try:
         return sh.worksheet(sheet_name)
@@ -87,55 +89,66 @@ def get_worksheet(sheet_name):
 
 @st.cache_data(ttl=10)
 def load_data(sheet_name):
-    """Đọc dữ liệu và xử lý tương thích cột cũ/mới"""
+    """Đọc dữ liệu và xử lý an toàn (Fix lỗi KeyError)"""
     ws = get_worksheet(sheet_name)
+    if not ws: return pd.DataFrame()
+    
     data = ws.get_all_records()
     df = pd.DataFrame(data)
     
-    # --- FIX LỖI KEY ERROR ---
-    # Nếu bảng Users có cột 'ClassID' (cũ), đổi tên nó thành 'TenLop' (mới)
+    # --- FIX LỖI TƯƠNG THÍCH CỘT ---
+    # 1. Bảng Users
     if sheet_name == "Users":
+        # Map ClassID -> TenLop nếu cột cũ tồn tại
         if 'ClassID' in df.columns and 'TenLop' not in df.columns:
             df = df.rename(columns={'ClassID': 'TenLop'})
-        # Nếu vẫn không có TenLop, tạo cột rỗng để tránh lỗi
+        # Đảm bảo cột TenLop luôn tồn tại
         if 'TenLop' not in df.columns:
             df['TenLop'] = ""
 
-    # Nếu bảng Classes có cột 'ID' (cũ) mà không dùng, vẫn giữ logic đọc cột TenLop
+    # 2. Bảng Classes
     if sheet_name == "Classes":
         if 'TenLop' not in df.columns and 'ID' in df.columns:
-             # Trường hợp dữ liệu cũ, Classes dùng ID làm tên lớp
              df['TenLop'] = df['ID']
 
-    # --- Xử lý kiểu dữ liệu ---
+    # --- XỬ LÝ KIỂU DỮ LIỆU AN TOÀN (Check if col exists) ---
     if sheet_name == "OKRs" and not df.empty:
-        df['ID'] = pd.to_numeric(df['ID'], errors='coerce')
-        df['ID_Dot'] = pd.to_numeric(df['ID_Dot'], errors='coerce')
-        df['TargetValue'] = pd.to_numeric(df['TargetValue'], errors='coerce').fillna(0)
-        df['ActualValue'] = pd.to_numeric(df['ActualValue'], errors='coerce').fillna(0)
-        df['DeleteRequest'] = pd.to_numeric(df['DeleteRequest'], errors='coerce').fillna(0)
+        if 'ID' in df.columns: df['ID'] = pd.to_numeric(df['ID'], errors='coerce')
+        if 'ID_Dot' in df.columns: df['ID_Dot'] = pd.to_numeric(df['ID_Dot'], errors='coerce')
+        if 'TargetValue' in df.columns: df['TargetValue'] = pd.to_numeric(df['TargetValue'], errors='coerce').fillna(0)
+        if 'ActualValue' in df.columns: df['ActualValue'] = pd.to_numeric(df['ActualValue'], errors='coerce').fillna(0)
+        if 'DeleteRequest' in df.columns: df['DeleteRequest'] = pd.to_numeric(df['DeleteRequest'], errors='coerce').fillna(0)
+
     if sheet_name == "Periods" and not df.empty:
-        df['ID'] = pd.to_numeric(df['ID'], errors='coerce')
+        # FIX LỖI CHÍNH Ở ĐÂY: Kiểm tra xem cột ID có tồn tại không
+        if 'ID' in df.columns:
+            df['ID'] = pd.to_numeric(df['ID'], errors='coerce')
+        else:
+            # Nếu thiếu cột ID, tự tạo index làm ID tạm thời để không crash
+            df['ID'] = df.index + 1
+            
     if sheet_name == "Classes" and not df.empty:
-        df['SiSo'] = pd.to_numeric(df['SiSo'], errors='coerce').fillna(0)
+        if 'SiSo' in df.columns: df['SiSo'] = pd.to_numeric(df['SiSo'], errors='coerce').fillna(0)
+
     if sheet_name == "FinalReviews" and not df.empty:
-        df['ID_Dot'] = pd.to_numeric(df['ID_Dot'], errors='coerce')
-        df['DaGui_PH'] = pd.to_numeric(df['DaGui_PH'], errors='coerce').fillna(0)
+        if 'ID_Dot' in df.columns: df['ID_Dot'] = pd.to_numeric(df['ID_Dot'], errors='coerce')
+        if 'DaGui_PH' in df.columns: df['DaGui_PH'] = pd.to_numeric(df['DaGui_PH'], errors='coerce').fillna(0)
+        
     return df
 
 def add_record(sheet_name, row_data):
     ws = get_worksheet(sheet_name)
-    ws.append_row(row_data)
-    st.cache_data.clear()
+    if ws:
+        ws.append_row(row_data)
+        st.cache_data.clear()
 
 def update_record(sheet_name, match_col, match_val, update_col, update_val, match_col_2=None, match_val_2=None):
     ws = get_worksheet(sheet_name)
+    if not ws: return
     try:
-        cell = None
         # Logic map tên cột cũ sang mới khi UPDATE
         real_match_col = match_col
         if sheet_name == "Users" and match_col == "TenLop":
-            # Kiểm tra xem sheet thật sự có cột TenLop hay ClassID
             headers = ws.row_values(1)
             if "ClassID" in headers and "TenLop" not in headers:
                 real_match_col = "ClassID"
@@ -143,7 +156,6 @@ def update_record(sheet_name, match_col, match_val, update_col, update_val, matc
         if match_col_2:
             records = ws.get_all_records()
             for i, r in enumerate(records):
-                # Lưu ý: r keys sẽ là header thực tế của sheet
                 val1 = str(r.get(real_match_col, r.get(match_col, '')))
                 val2 = str(r.get(match_col_2, ''))
                 
@@ -153,10 +165,8 @@ def update_record(sheet_name, match_col, match_val, update_col, update_val, matc
                     ws.update_cell(row_idx, col_idx, update_val)
                     break
         else:
-            # Tìm cột match
             find_col = ws.find(real_match_col)
-            if not find_col: # Fallback nếu không tìm thấy cột
-                return
+            if not find_col: return
                 
             cell = ws.find(str(match_val), in_column=find_col.col)
             if cell:
@@ -168,6 +178,7 @@ def update_record(sheet_name, match_col, match_val, update_col, update_val, matc
 
 def delete_record(sheet_name, match_col, match_val):
     ws = get_worksheet(sheet_name)
+    if not ws: return
     try:
         cell = ws.find(str(match_val), in_column=ws.find(match_col).col)
         if cell:
@@ -238,9 +249,15 @@ def change_password_ui(email):
 def get_periods_map(role):
     df = load_data("Periods")
     if df.empty: return {}
+    # Fix: Kiểm tra xem cột TrangThai có tồn tại không
+    if 'TrangThai' not in df.columns: return {}
+    
     if role != 'Admin':
         df = df[df['TrangThai'] == 'Mo']
-    return dict(zip(df['TenDot'], df['ID']))
+        
+    if 'TenDot' in df.columns and 'ID' in df.columns:
+        return dict(zip(df['TenDot'], df['ID']))
+    return {}
 
 # ==============================================================================
 # DASHBOARD LOGIC
@@ -254,6 +271,10 @@ def login_page():
         submitted = st.form_submit_button("Đăng nhập")
         if submitted:
             df_users = load_data("Users")
+            if df_users.empty:
+                st.error("Không kết nối được dữ liệu User.")
+                return
+
             # Convert to string to ensure matching
             df_users['Password'] = df_users['Password'].astype(str)
             
@@ -261,9 +282,7 @@ def login_page():
             
             if not user.empty:
                 u = user.iloc[0]
-                # Fix lỗi KeyError: Dùng .get để an toàn nếu cột TenLop chưa tồn tại
                 ten_lop_val = u.get('TenLop', '')
-                
                 st.session_state['user'] = {
                     'email': u['Email'], 
                     'name': u['HoTen'], 
@@ -295,8 +314,9 @@ def admin_dashboard(period_id):
             all_users = load_data("Users")
             
             for _, cl in classes.iterrows():
-                siso = float(cl['SiSo'])
-                ten_lop = cl['TenLop']
+                siso = float(cl['SiSo']) if 'SiSo' in cl else 0
+                ten_lop = cl.get('TenLop', 'N/A')
+                gvcn = cl.get('EmailGVCN', 'N/A')
                 
                 # Lọc HS theo Tên Lớp
                 class_users = []
@@ -316,7 +336,7 @@ def admin_dashboard(period_id):
                 
                 stats_data.append({
                     "Tên Lớp": ten_lop,
-                    "GVCN": cl['EmailGVCN'],
+                    "GVCN": gvcn,
                     "Sĩ Số": int(siso),
                     "Đã Duyệt Tổng Kết (%)": f"{pct_approved}%",
                     "Chưa Duyệt (%)": f"{100 - pct_approved}%"
@@ -351,21 +371,24 @@ def admin_dashboard(period_id):
             for _, cl in classes.iterrows():
                 with st.container(border=True):
                     c1, c2 = st.columns([3, 1])
-                    c1.write(f"**{cl['TenLop']}** - GV: {cl['EmailGVCN']}")
-                    if c2.button("🚀 Cấp TK", key=f"grant_{cl['TenLop']}"):
-                        update_record("Users", "Email", cl['EmailGVCN'], "Password", "123")
-                        st.toast(f"Đã kích hoạt tài khoản cho GV: {cl['EmailGVCN']} (Pass: 123)")
+                    t_lop = cl.get('TenLop', 'N/A')
+                    e_gv = cl.get('EmailGVCN', 'N/A')
+                    c1.write(f"**{t_lop}** - GV: {e_gv}")
+                    if c2.button("🚀 Cấp TK", key=f"grant_{t_lop}"):
+                        update_record("Users", "Email", e_gv, "Password", "123")
+                        st.toast(f"Đã kích hoạt tài khoản cho GV: {e_gv} (Pass: 123)")
 
     with tab2:
         st.subheader("Quản lý User")
         search = st.text_input("Tìm Email:")
         if search:
             users = load_data("Users")
-            u = users[users['Email'] == search]
-            st.write(u)
-            if not u.empty and st.button("Reset Pass"):
-                update_record("Users", "Email", search, "Password", "123")
-                st.success("Đã reset về 123")
+            if not users.empty:
+                u = users[users['Email'] == search]
+                st.write(u)
+                if not u.empty and st.button("Reset Pass"):
+                    update_record("Users", "Email", search, "Password", "123")
+                    st.success("Đã reset về 123")
 
     with tab3:
         st.subheader("Quản lý Đợt")
@@ -373,16 +396,19 @@ def admin_dashboard(period_id):
         for i, row in periods.iterrows():
             c_tog, c_del = st.columns([4, 1])
             with c_tog:
-                is_open = row['TrangThai'] == 'Mo'
-                toggle = st.toggle(f"{row['TenDot']} (ID: {row['ID']})", value=is_open, key=f"p_{row['ID']}")
+                is_open = row.get('TrangThai') == 'Mo'
+                p_id = row.get('ID')
+                p_name = row.get('TenDot', 'Unknown')
+                
+                toggle = st.toggle(f"{p_name} (ID: {p_id})", value=is_open, key=f"p_{p_id}")
                 new_st = 'Mo' if toggle else 'Khoa'
-                if new_st != row['TrangThai']:
-                    update_record("Periods", "ID", row['ID'], "TrangThai", new_st)
+                if new_st != row.get('TrangThai'):
+                    update_record("Periods", "ID", p_id, "TrangThai", new_st)
                     st.rerun()
             with c_del:
-                if st.button("🗑️", key=f"del_p_{row['ID']}"):
-                    delete_record("Periods", "ID", row['ID'])
-                    st.warning(f"Đã xóa đợt: {row['TenDot']}")
+                if st.button("🗑️", key=f"del_p_{p_id}"):
+                    delete_record("Periods", "ID", p_id)
+                    st.warning(f"Đã xóa đợt: {p_name}")
                     st.rerun()
         
         with st.form("new_period"):
@@ -399,6 +425,10 @@ def teacher_dashboard(period_id):
     change_password_ui(user_email)
     
     classes = load_data("Classes")
+    if classes.empty:
+        st.warning("Dữ liệu lớp học trống.")
+        return
+
     my_class = classes[classes['EmailGVCN'] == user_email]
     
     if my_class.empty:
@@ -702,7 +732,7 @@ def parent_dashboard(period_id):
     
     users = load_data("Users")
     child_info = users[users['Email'] == child_email].iloc[0]
-    st.info(f"Con: {child_info['HoTen']} - Lớp: {child_info['TenLop']}")
+    st.info(f"Con: {child_info['HoTen']} - Lớp: {child_info.get('TenLop', '')}")
     
     all_okrs = load_data("OKRs")
     df_okr = pd.DataFrame()
