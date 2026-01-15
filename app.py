@@ -9,7 +9,7 @@ import time
 # CẤU HÌNH TRANG & GIAO DIỆN (THEME)
 # ==============================================================================
 st.set_page_config(
-    page_title="Hệ thống Quản lý OKR Trường học (V3)",
+    page_title="Hệ thống Quản lý OKR Trường học (V4)",
     page_icon="🎓",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -28,10 +28,13 @@ st.markdown("""
         border-radius: 15px;
         font-size: 0.8rem;
         font-weight: bold;
+        text-align: center;
+        min-width: 80px;
     }
-    .badge-green { background-color: #d4edda; color: #155724; }
-    .badge-red { background-color: #f8d7da; color: #721c24; }
-    .badge-yellow { background-color: #fff3cd; color: #856404; }
+    .badge-green { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+    .badge-red { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+    .badge-yellow { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
+    .badge-grey { background-color: #e2e3e5; color: #383d41; border: 1px solid #d6d8db; }
     .big-score { font-size: 24px; font-weight: bold; color: #E65100; }
     .student-row {
         padding: 10px;
@@ -40,7 +43,6 @@ st.markdown("""
         align-items: center;
         justify-content: space-between;
     }
-    .student-row:hover { background-color: #fff3e0; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -179,9 +181,17 @@ def change_password_ui(email):
                 else:
                     st.error("Mật khẩu không khớp.")
 
-def get_periods_map():
+def get_periods_map(role):
+    """
+    Lấy danh sách đợt.
+    - Admin: Lấy tất cả.
+    - GV, HS, PH: Chỉ lấy đợt 'Mo'.
+    """
     conn = get_connection()
-    df = pd.read_sql("SELECT ID, TenDot, TrangThai FROM Periods", conn)
+    if role == 'Admin':
+        df = pd.read_sql("SELECT ID, TenDot, TrangThai FROM Periods", conn)
+    else:
+        df = pd.read_sql("SELECT ID, TenDot, TrangThai FROM Periods WHERE TrangThai='Mo'", conn)
     conn.close()
     if df.empty: return {}
     return dict(zip(df['TenDot'], df['ID']))
@@ -226,15 +236,9 @@ def admin_dashboard(period_id):
         if classes.empty:
             st.info("Chưa có lớp học nào.")
         else:
-            # Tạo bảng thống kê custom
             stats_data = []
             for _, cl in classes.iterrows():
-                # Tổng HS trong lớp (Dựa trên User thực tế hoặc Sĩ số khai báo)
-                # Tính dựa trên Sĩ số khai báo (SiSo)
                 siso = cl['SiSo']
-                
-                # Đếm số HS đã được Duyệt (TrangThai = 'HoanThanh' hoặc 'DaDuyetMucTieu' hoặc có FinalReview)
-                # Logic: HS được tính là "Đã hoàn thành" nếu GV đã nhập nhận xét cuối kỳ (FinalReviews)
                 q_approved = f"""
                     SELECT COUNT(DISTINCT FinalReviews.Email_HocSinh)
                     FROM FinalReviews 
@@ -243,25 +247,20 @@ def admin_dashboard(period_id):
                     AND FinalReviews.NhanXet_GV IS NOT NULL AND FinalReviews.NhanXet_GV != ''
                 """
                 approved_count = pd.read_sql(q_approved, conn).iloc[0,0]
-                
                 pct_approved = round((approved_count / siso * 100), 1) if siso > 0 else 0
-                pct_pending = 100 - pct_approved
                 
                 stats_data.append({
                     "ID Lớp": cl['ID'],
                     "Tên Lớp": cl['TenLop'],
                     "GVCN": cl['EmailGVCN'],
                     "Sĩ Số": siso,
-                    "Đã Duyệt (%)": f"{pct_approved}%",
-                    "Chưa Duyệt (%)": f"{pct_pending}%"
+                    "Đã Duyệt Tổng Kết (%)": f"{pct_approved}%",
+                    "Chưa Duyệt (%)": f"{100 - pct_approved}%"
                 })
-            
-            # Hiển thị DataFrame
             st.dataframe(pd.DataFrame(stats_data))
 
         st.divider()
         st.markdown("### 🏫 Tạo Lớp & Cấp Tài khoản")
-        
         col_a, col_b = st.columns([1, 2])
         with col_a:
             with st.form("add_class_admin"):
@@ -272,10 +271,8 @@ def admin_dashboard(period_id):
                     if c_name and c_gv:
                         gen_id = f"{c_name}_{int(time.time())}"
                         try:
-                            # Tạo lớp
                             conn.execute("INSERT INTO Classes (ID, TenLop, EmailGVCN, SiSo) VALUES (?,?,?,?)", 
                                          (gen_id, c_name, c_gv, c_siso))
-                            # Tạo tài khoản GV mặc định
                             cursor = conn.cursor()
                             cursor.execute("SELECT 1 FROM Users WHERE Email=?", (c_gv,))
                             if not cursor.fetchone():
@@ -287,7 +284,6 @@ def admin_dashboard(period_id):
                         except Exception as e:
                             st.error(f"Lỗi: {e}")
 
-        # Danh sách các lớp để "Cấp tài khoản" (Kích hoạt)
         with col_b:
             st.write("###### Danh sách kích hoạt")
             for _, cl in classes.iterrows():
@@ -295,12 +291,10 @@ def admin_dashboard(period_id):
                     c1, c2 = st.columns([3, 1])
                     c1.write(f"**{cl['TenLop']}** - GV: {cl['EmailGVCN']}")
                     if c2.button("🚀 Cấp TK", key=f"grant_{cl['ID']}"):
-                        # Logic giả lập cấp tài khoản: Reset pass về 123 và thông báo
                         conn.execute("UPDATE Users SET Password='123' WHERE Email=?", (cl['EmailGVCN'],))
                         conn.commit()
                         st.toast(f"Đã kích hoạt tài khoản cho GV: {cl['EmailGVCN']} (Pass: 123)")
 
-    # TAB 2 & 3: Giữ nguyên logic quản lý
     with tab2:
         st.subheader("Quản lý User")
         search = st.text_input("Tìm Email:")
@@ -316,13 +310,21 @@ def admin_dashboard(period_id):
         st.subheader("Quản lý Đợt")
         periods = pd.read_sql("SELECT * FROM Periods", conn)
         for i, row in periods.iterrows():
-            is_open = row['TrangThai'] == 'Mo'
-            toggle = st.toggle(f"{row['TenDot']}", value=is_open, key=f"p_{row['ID']}")
-            new_st = 'Mo' if toggle else 'Khoa'
-            if new_st != row['TrangThai']:
-                conn.execute("UPDATE Periods SET TrangThai=? WHERE ID=?", (new_st, row['ID']))
-                conn.commit()
-                st.rerun()
+            c_tog, c_del = st.columns([4, 1])
+            with c_tog:
+                is_open = row['TrangThai'] == 'Mo'
+                toggle = st.toggle(f"{row['TenDot']} (ID: {row['ID']})", value=is_open, key=f"p_{row['ID']}")
+                new_st = 'Mo' if toggle else 'Khoa'
+                if new_st != row['TrangThai']:
+                    conn.execute("UPDATE Periods SET TrangThai=? WHERE ID=?", (new_st, row['ID']))
+                    conn.commit()
+                    st.rerun()
+            with c_del:
+                if st.button("🗑️", key=f"del_p_{row['ID']}"):
+                    conn.execute("DELETE FROM Periods WHERE ID=?", (row['ID'],))
+                    conn.commit()
+                    st.warning(f"Đã xóa đợt: {row['TenDot']}")
+                    st.rerun()
         
         with st.form("new_period"):
             p_name = st.text_input("Tên đợt mới")
@@ -340,7 +342,6 @@ def teacher_dashboard(period_id):
     change_password_ui(user_email)
     conn = get_connection()
     
-    # Check Class
     my_class = pd.read_sql("SELECT * FROM Classes WHERE EmailGVCN=?", conn, params=(user_email,))
     if my_class.empty:
         st.warning("Bạn chưa được phân công lớp.")
@@ -348,55 +349,74 @@ def teacher_dashboard(period_id):
         return
 
     class_id = my_class.iloc[0]['ID']
-    st.info(f"Lớp: {my_class.iloc[0]['TenLop']} (ID: {class_id}) - Đợt làm việc: {period_id}")
+    st.info(f"Lớp: {my_class.iloc[0]['TenLop']} (ID: {class_id}) - Đợt làm việc ID: {period_id}")
 
     tab1, tab2 = st.tabs(["Danh sách Học sinh (List View)", "Import Excel"])
 
     with tab1:
-        st.subheader("📋 Danh sách OKR Học sinh")
+        st.subheader("📋 Trạng thái OKR Học sinh")
         
-        # Lấy danh sách HS trong lớp
+        # Danh sách HS
         students = pd.read_sql("SELECT Email, HoTen FROM Users WHERE ClassID=?", conn, params=(class_id,))
         
         if students.empty:
             st.write("Lớp chưa có học sinh.")
         else:
             # Header
-            cols = st.columns([1, 3, 2, 2, 2])
+            cols = st.columns([0.5, 2, 1.5, 1.5, 1])
             cols[0].markdown("**STT**")
             cols[1].markdown("**Họ Tên**")
-            cols[2].markdown("**Trạng thái Nộp**")
-            cols[3].markdown("**Trạng thái Duyệt**")
+            cols[2].markdown("**Duyệt Lần 1 (Mục Tiêu)**")
+            cols[3].markdown("**Duyệt Lần 2 (Tổng Kết)**")
             cols[4].markdown("**Hành động**")
             
             for idx, hs in students.iterrows():
-                # Check status
-                # 1. Đã tạo OKR chưa?
-                count_okr = pd.read_sql("SELECT COUNT(*) FROM OKRs WHERE Email_HocSinh=? AND ID_Dot=?", conn, params=(hs['Email'], period_id)).iloc[0,0]
-                has_submitted = count_okr > 0
+                # Logic xác định trạng thái Lần 1 (Mục tiêu)
+                # - Chưa tạo -> Đỏ
+                # - Có item chưa duyệt -> Vàng
+                # - Đã duyệt hết -> Xanh
+                okrs = pd.read_sql("SELECT TrangThai, DeleteRequest FROM OKRs WHERE Email_HocSinh=? AND ID_Dot=?", conn, params=(hs['Email'], period_id))
                 
-                # 2. Đã duyệt chưa? (Dựa vào FinalReviews hoặc OKR status)
-                has_review = pd.read_sql("SELECT COUNT(*) FROM FinalReviews WHERE Email_HocSinh=? AND ID_Dot=? AND NhanXet_GV IS NOT NULL AND NhanXet_GV != ''", 
-                                         conn, params=(hs['Email'], period_id)).iloc[0,0] > 0
+                l1_status = ""
+                l1_badge = ""
+                
+                if okrs.empty:
+                    l1_status = "Chưa tạo"
+                    l1_badge = "badge-red"
+                else:
+                    pending_count = okrs[okrs['TrangThai'] == 'ChoDuyet'].shape[0]
+                    if pending_count > 0:
+                        l1_status = "Chờ duyệt"
+                        l1_badge = "badge-yellow"
+                    else:
+                        l1_status = "Đã duyệt"
+                        l1_badge = "badge-green"
+
+                # Logic xác định trạng thái Lần 2 (Tổng kết)
+                # Check bảng FinalReviews
+                fr = pd.read_sql("SELECT * FROM FinalReviews WHERE Email_HocSinh=? AND ID_Dot=? AND NhanXet_GV IS NOT NULL AND NhanXet_GV != ''", 
+                                         conn, params=(hs['Email'], period_id))
+                has_final_review = not fr.empty
+                
+                l2_status = "Đã xong" if has_final_review else "Chưa xong"
+                l2_badge = "badge-green" if has_final_review else "badge-grey"
+                
+                # Check yêu cầu xóa
+                has_del_req = not okrs[okrs['DeleteRequest'] == 1].empty
                 
                 with st.container():
-                    c = st.columns([1, 3, 2, 2, 2])
+                    c = st.columns([0.5, 2, 1.5, 1.5, 1])
                     c[0].write(f"{idx+1}")
-                    c[1].write(hs['HoTen'])
                     
-                    # Status Badges
-                    if has_submitted:
-                        c[2].markdown('<span class="status-badge badge-green">🟢 Đã làm</span>', unsafe_allow_html=True)
-                    else:
-                        c[2].markdown('<span class="status-badge badge-red">🔴 Chưa làm</span>', unsafe_allow_html=True)
-                        
-                    if has_review:
-                        c[3].markdown('<span class="status-badge badge-green">✅ Đã duyệt</span>', unsafe_allow_html=True)
-                    else:
-                        c[3].markdown('<span class="status-badge badge-yellow">⚠️ Chưa duyệt</span>', unsafe_allow_html=True)
+                    name_display = hs['HoTen']
+                    if has_del_req:
+                        name_display += " ⚠️ (Có yêu cầu xóa)"
+                    c[1].write(name_display)
                     
-                    # Action Button
-                    if c[4].button("Xem chi tiết", key=f"view_{hs['Email']}"):
+                    c[2].markdown(f'<span class="status-badge {l1_badge}">{l1_status}</span>', unsafe_allow_html=True)
+                    c[3].markdown(f'<span class="status-badge {l2_badge}">{l2_status}</span>', unsafe_allow_html=True)
+                    
+                    if c[4].button("Chi tiết", key=f"view_{hs['Email']}"):
                         st.session_state['selected_hs'] = hs
                         st.rerun()
 
@@ -407,16 +427,20 @@ def teacher_dashboard(period_id):
                 hs_curr = st.session_state['selected_hs']
                 st.markdown(f"### 📝 Chi tiết: {hs_curr['HoTen']}")
                 
-                # Load OKRs
                 df_okr = pd.read_sql("SELECT * FROM OKRs WHERE Email_HocSinh=? AND ID_Dot=?", conn, params=(hs_curr['Email'], period_id))
                 
                 if df_okr.empty:
                     st.warning("Học sinh này chưa nhập OKR nào.")
                 else:
-                    # Duyệt Mục Tiêu (Lần 1) & Kết quả
                     for i, row in df_okr.iterrows():
                         with st.container(border=True):
                             c1, c2, c3 = st.columns([4, 2, 2])
+                            
+                            # Hiển thị yêu cầu xóa nếu có
+                            bg_color = ""
+                            if row['DeleteRequest'] == 1:
+                                st.error(f"⚠️ Học sinh yêu cầu xóa mục tiêu: {row['MucTieu']} - {row['KetQuaThenChot']}")
+                            
                             c1.markdown(f"**O:** {row['MucTieu']}")
                             c1.text(f"KR: {row['KetQuaThenChot']}")
                             
@@ -426,16 +450,17 @@ def teacher_dashboard(period_id):
                             
                             with c3:
                                 st.write(f"TT: {row['TrangThai']}")
-                                # Nút Duyệt Mục Tiêu
+                                
+                                # Xử lý duyệt Lần 1
                                 if row['TrangThai'] == 'ChoDuyet':
-                                    if st.button("Duyệt Mục Tiêu", key=f"app_{row['ID']}"):
+                                    if st.button("✅ Duyệt Mục Tiêu", key=f"app_{row['ID']}"):
                                         conn.execute("UPDATE OKRs SET TrangThai='DaDuyetMucTieu' WHERE ID=?", (row['ID'],))
                                         conn.commit()
                                         st.rerun()
-                                # Xử lý xóa
+                                
+                                # Xử lý Yêu cầu xóa
                                 if row['DeleteRequest'] == 1:
-                                    st.error("Yêu cầu xóa!")
-                                    if st.button("Đồng ý xóa", key=f"del_{row['ID']}"):
+                                    if st.button("🗑️ Chấp thuận xóa", key=f"del_{row['ID']}"):
                                         conn.execute("DELETE FROM OKRs WHERE ID=?", (row['ID'],))
                                         conn.commit()
                                         st.rerun()
@@ -448,7 +473,7 @@ def teacher_dashboard(period_id):
                     
                     with st.form("teacher_review"):
                         cmt = st.text_area("Nhận xét giáo viên:", value=old_cmt)
-                        if st.form_submit_button("Lưu & Hoàn tất Duyệt"):
+                        if st.form_submit_button("Lưu & Hoàn tất Duyệt Lần 2"):
                             conn.execute("INSERT OR REPLACE INTO FinalReviews (Email_HocSinh, ID_Dot, NhanXet_GV) VALUES (?,?,?)",
                                          (hs_curr['Email'], period_id, cmt))
                             conn.commit()
@@ -463,10 +488,8 @@ def teacher_dashboard(period_id):
                 df = pd.read_excel(upl)
                 count = 0
                 for _, r in df.iterrows():
-                    # Thêm HS
                     conn.execute("INSERT OR IGNORE INTO Users (Email, Password, HoTen, VaiTro, ClassID) VALUES (?,?,?,?,?)",
                                  (r['Email'], '123', r['HoTen'], 'HocSinh', class_id))
-                    # Thêm PH
                     if pd.notna(r['EmailPH']):
                         conn.execute("INSERT OR IGNORE INTO Users (Email, Password, HoTen, VaiTro) VALUES (?,?,'Phụ Huynh','PhuHuynh')",
                                      (str(r['EmailPH']), '123'))
@@ -506,7 +529,7 @@ def student_dashboard(period_id):
                     st.success("Đã thêm!")
                     st.rerun()
 
-    # 2. HIỂN THỊ (GROUP BY OBJECTIVE)
+    # 2. HIỂN THỊ
     st.divider()
     st.subheader("📋 OKR của tôi")
     
@@ -515,16 +538,12 @@ def student_dashboard(period_id):
     if df_okrs.empty:
         st.info("Chưa có dữ liệu.")
     else:
-        # Group by Objective
         unique_objs = df_okrs['MucTieu'].unique()
-        
         total_pct = 0
         count_kr = 0
         
         for obj in unique_objs:
             st.markdown(f"#### 🎯 O: {obj}")
-            
-            # Get KRs for this Objective
             krs = df_okrs[df_okrs['MucTieu'] == obj]
             
             for _, row in krs.iterrows():
@@ -535,13 +554,16 @@ def student_dashboard(period_id):
                 with st.container(border=True):
                     c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
                     c1.markdown(f"**KR:** {row['KetQuaThenChot']}")
-                    c1.caption(f"Trạng thái: {row['TrangThai']}")
                     
-                    # Progress Section
+                    status_text = row['TrangThai']
+                    if row['DeleteRequest'] == 1:
+                        status_text += " (Đang chờ xóa)"
+                        
+                    c1.caption(f"Trạng thái: {status_text}")
+                    
                     c2.metric("Tiến độ", f"{row['ActualValue']} / {row['TargetValue']} {row['Unit']}")
                     c2.progress(min(pct/100, 1.0))
                     
-                    # Update Result Popover
                     with c3:
                         with st.popover("Báo cáo KQ"):
                             with st.form(f"upd_{row['ID']}"):
@@ -551,29 +573,21 @@ def student_dashboard(period_id):
                                     conn.commit()
                                     st.rerun()
                     
-                    # Delete Request
                     with c4:
-                        if row['TrangThai'] == 'ChoDuyet':
-                            if st.button("🗑️", key=f"del_{row['ID']}"):
-                                conn.execute("DELETE FROM OKRs WHERE ID=?", (row['ID'],))
+                        # Nút xóa luôn gửi yêu cầu
+                        if row['DeleteRequest'] == 0:
+                            if st.button("🗑️ Xin xóa", key=f"req_{row['ID']}"):
+                                conn.execute("UPDATE OKRs SET DeleteRequest=1 WHERE ID=?", (row['ID'],))
                                 conn.commit()
                                 st.rerun()
                         else:
-                            if row['DeleteRequest'] == 0:
-                                if st.button("Xin xóa", key=f"req_{row['ID']}"):
-                                    conn.execute("UPDATE OKRs SET DeleteRequest=1 WHERE ID=?", (row['ID'],))
-                                    conn.commit()
-                                    st.rerun()
-                            else:
-                                st.caption("Đang chờ xóa")
+                            st.caption("⏳ Đợi duyệt")
 
-        # 3. TỔNG KẾT
         st.divider()
         final_score = round(total_pct / count_kr, 1) if count_kr > 0 else 0
         rank, color = get_rank(final_score)
         st.markdown(f"### 🏁 Tổng kết: <span style='color:{color}'>{final_score}% - {rank}</span>", unsafe_allow_html=True)
         
-        # Xem Nhận xét
         fr = pd.read_sql("SELECT * FROM FinalReviews WHERE Email_HocSinh=? AND ID_Dot=?", conn, params=(user_email, period_id))
         if not fr.empty:
             st.info(f"👨‍🏫 Giáo viên nhận xét: {fr.iloc[0]['NhanXet_GV']}")
@@ -597,7 +611,6 @@ def parent_dashboard(period_id):
     child_info = pd.read_sql("SELECT HoTen, ClassID FROM Users WHERE Email=?", conn, params=(child_email,))
     st.info(f"Con: {child_info.iloc[0]['HoTen']} - Lớp: {child_info.iloc[0]['ClassID']}")
     
-    # Hiển thị OKR
     df_okr = pd.read_sql("SELECT * FROM OKRs WHERE Email_HocSinh=? AND ID_Dot=?", conn, params=(child_email, period_id))
     
     if df_okr.empty:
@@ -616,7 +629,6 @@ def parent_dashboard(period_id):
         r, c = get_rank(avg)
         st.markdown(f"#### Tổng kết: <span style='color:{c}'>{avg}% ({r})</span>", unsafe_allow_html=True)
         
-        # Nhận xét
         st.divider()
         col1, col2 = st.columns(2)
         fr = pd.read_sql("SELECT * FROM FinalReviews WHERE Email_HocSinh=? AND ID_Dot=?", conn, params=(child_email, period_id))
@@ -639,7 +651,6 @@ def parent_dashboard(period_id):
                 with st.form("ph_cmt"):
                     txt = st.text_area("Ý kiến:", value=cmt_ph)
                     if st.form_submit_button("Gửi"):
-                        # Insert/Update logic safe
                         cursor = conn.cursor()
                         cursor.execute("SELECT 1 FROM FinalReviews WHERE Email_HocSinh=? AND ID_Dot=?", (child_email, period_id))
                         if cursor.fetchone():
@@ -658,23 +669,24 @@ def main():
     if 'user' not in st.session_state:
         login_page()
     else:
+        role = st.session_state['user']['role']
+        
         # SIDEBAR GLOBAL SETTINGS
         with st.sidebar:
             st.markdown(f"### 👤 {st.session_state['user']['name']}")
-            st.caption(f"Vai trò: {st.session_state['user']['role']}")
+            st.caption(f"Vai trò: {role}")
             
             st.divider()
             st.write("📅 **Chọn Đợt (Học kỳ):**")
-            periods_map = get_periods_map()
+            
+            # Lọc đợt theo vai trò
+            periods_map = get_periods_map(role)
+            
             if periods_map:
-                # Tìm đợt đang mở để default
-                default_idx = 0
-                # Logic tìm index của đợt 'Mo' đầu tiên nếu muốn, hoặc để mặc định cái đầu
-                
                 selected_period_name = st.selectbox("Danh sách đợt:", list(periods_map.keys()))
                 selected_period_id = periods_map[selected_period_name]
             else:
-                st.warning("Chưa có Đợt nào.")
+                st.warning("Chưa có Đợt nào khả dụng.")
                 selected_period_id = None
             
             st.divider()
@@ -685,16 +697,15 @@ def main():
 
         # ROUTING
         if selected_period_id:
-            role = st.session_state['user']['role']
             if role == 'Admin': admin_dashboard(selected_period_id)
             elif role == 'GiaoVien': teacher_dashboard(selected_period_id)
             elif role == 'HocSinh': student_dashboard(selected_period_id)
             elif role == 'PhuHuynh': parent_dashboard(selected_period_id)
         else:
-            if st.session_state['user']['role'] == 'Admin':
+            if role == 'Admin':
                 admin_dashboard(0) # Cho vào để tạo đợt
             else:
-                st.info("Vui lòng đợi Admin tạo Đợt làm việc.")
+                st.info("Hiện không có đợt nhập liệu nào đang mở.")
 
 if __name__ == "__main__":
     main()
