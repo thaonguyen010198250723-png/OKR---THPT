@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import json
 import unicodedata
 from fpdf import FPDF
 import time
@@ -9,7 +11,7 @@ import time
 # CẤU HÌNH TRANG & GIAO DIỆN (THEME)
 # ==============================================================================
 st.set_page_config(
-    page_title="Hệ thống Quản lý OKR Trường học (V5)",
+    page_title="Hệ thống Quản lý OKR Trường học (GSheets V1)",
     page_icon="🎓",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -36,112 +38,148 @@ st.markdown("""
     .badge-yellow { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
     .badge-grey { background-color: #e2e3e5; color: #383d41; border: 1px solid #d6d8db; }
     .big-score { font-size: 24px; font-weight: bold; color: #E65100; }
-    .student-row {
-        padding: 10px;
-        border-bottom: 1px solid #eee;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-    }
 </style>
 """, unsafe_allow_html=True)
 
 # ==============================================================================
-# XỬ LÝ DATABASE (SQLITE) & MIGRATION
+# XỬ LÝ KẾT NỐI GOOGLE SHEETS
 # ==============================================================================
-DB_FILE = "school_okr.db"
+SHEET_ID = "14E2JfVyOhGMa7T1VA44F31IaPMWIVIPRApo4B-ipDLk"
 
-def get_connection():
-    return sqlite3.connect(DB_FILE)
+@st.cache_resource
+def init_connection():
+    """Khởi tạo kết nối đến Google Sheets"""
+    scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+    
+    # Đọc credentials từ Streamlit Secrets
+    creds_dict = json.loads(st.secrets["service_account"]["info"])
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    client = gspread.authorize(creds)
+    
+    return client
 
-def init_and_migrate_db():
-    """Khởi tạo và tự động cập nhật cấu trúc bảng mới"""
+def get_worksheet(sheet_name):
+    """Lấy worksheet, nếu chưa có thì tạo mới (để đảm bảo không lỗi)"""
+    client = init_connection()
+    sh = client.open_by_key(SHEET_ID)
     try:
-        conn = get_connection()
-        c = conn.cursor()
+        return sh.worksheet(sheet_name)
+    except gspread.WorksheetNotFound:
+        # Tạo tab mới nếu thiếu (cho Relationships và FinalReviews)
+        ws = sh.add_worksheet(title=sheet_name, rows=100, cols=20)
+        # Tạo header mặc định
+        if sheet_name == "Users":
+            ws.append_row(["Email", "Password", "HoTen", "VaiTro", "ClassID"])
+            # Seed Admin
+            ws.append_row(["admin@school.com", "123", "Quản Trị Viên", "Admin", ""])
+        elif sheet_name == "Classes":
+            ws.append_row(["ID", "TenLop", "EmailGVCN", "SiSo"])
+        elif sheet_name == "Periods":
+            ws.append_row(["ID", "TenDot", "TrangThai"])
+        elif sheet_name == "Relationships":
+            ws.append_row(["Email_HocSinh", "Email_PhuHuynh"])
+        elif sheet_name == "OKRs":
+            ws.append_row(["ID", "Email_HocSinh", "ID_Dot", "MucTieu", "KetQuaThenChot", "TienDo", "TrangThai", "NhanXet_GV", "NhanXet_PH", "MinhChung", "TargetValue", "ActualValue", "Unit", "DeleteRequest"])
+        elif sheet_name == "FinalReviews":
+            ws.append_row(["Email_HocSinh", "ID_Dot", "NhanXet_GV", "NhanXet_PH", "DaGui_PH"])
+        return ws
 
-        # 1. Bảng Users
-        c.execute('''CREATE TABLE IF NOT EXISTS Users (
-            Email TEXT PRIMARY KEY,
-            Password TEXT,
-            HoTen TEXT,
-            VaiTro TEXT,
-            ClassID TEXT
-        )''')
+# --- CÁC HÀM CRUD (CREATE, READ, UPDATE, DELETE) ---
 
-        # 2. Bảng Classes
-        c.execute('''CREATE TABLE IF NOT EXISTS Classes (
-            ID TEXT PRIMARY KEY,
-            TenLop TEXT,
-            EmailGVCN TEXT,
-            SiSo INTEGER
-        )''')
+@st.cache_data(ttl=10) # Cache dữ liệu 10 giây để tránh reload chậm
+def load_data(sheet_name):
+    """Đọc toàn bộ dữ liệu từ 1 tab về DataFrame"""
+    ws = get_worksheet(sheet_name)
+    data = ws.get_all_records()
+    df = pd.DataFrame(data)
+    # Chuyển đổi kiểu dữ liệu số nếu cần thiết
+    if sheet_name == "OKRs" and not df.empty:
+        df['ID'] = pd.to_numeric(df['ID'], errors='coerce')
+        df['ID_Dot'] = pd.to_numeric(df['ID_Dot'], errors='coerce')
+        df['TargetValue'] = pd.to_numeric(df['TargetValue'], errors='coerce').fillna(0)
+        df['ActualValue'] = pd.to_numeric(df['ActualValue'], errors='coerce').fillna(0)
+        df['DeleteRequest'] = pd.to_numeric(df['DeleteRequest'], errors='coerce').fillna(0)
+    if sheet_name == "Periods" and not df.empty:
+        df['ID'] = pd.to_numeric(df['ID'], errors='coerce')
+    if sheet_name == "Classes" and not df.empty:
+        df['SiSo'] = pd.to_numeric(df['SiSo'], errors='coerce').fillna(0)
+    if sheet_name == "FinalReviews" and not df.empty:
+        df['ID_Dot'] = pd.to_numeric(df['ID_Dot'], errors='coerce')
+        df['DaGui_PH'] = pd.to_numeric(df['DaGui_PH'], errors='coerce').fillna(0)
+    return df
 
-        # 3. Bảng Periods
-        c.execute('''CREATE TABLE IF NOT EXISTS Periods (
-            ID INTEGER PRIMARY KEY AUTOINCREMENT,
-            TenDot TEXT,
-            TrangThai TEXT
-        )''')
+def add_record(sheet_name, row_data):
+    """Thêm dòng mới"""
+    ws = get_worksheet(sheet_name)
+    ws.append_row(row_data)
+    st.cache_data.clear() # Xóa cache để cập nhật dữ liệu mới
 
-        # 4. Bảng Relationships
-        c.execute('''CREATE TABLE IF NOT EXISTS Relationships (
-            Email_HocSinh TEXT,
-            Email_PhuHuynh TEXT,
-            PRIMARY KEY (Email_HocSinh, Email_PhuHuynh)
-        )''')
-
-        # 5. Bảng OKRs
-        c.execute('''CREATE TABLE IF NOT EXISTS OKRs (
-            ID INTEGER PRIMARY KEY AUTOINCREMENT,
-            Email_HocSinh TEXT,
-            ID_Dot INTEGER,
-            MucTieu TEXT,
-            KetQuaThenChot TEXT,
-            TienDo INTEGER,
-            TrangThai TEXT, 
-            NhanXet_GV TEXT,
-            NhanXet_PH TEXT,
-            MinhChung TEXT
-        )''')
-
-        # === MIGRATION: Thêm cột mới ===
-        try: c.execute("ALTER TABLE OKRs ADD COLUMN TargetValue REAL DEFAULT 0")
-        except: pass
-        try: c.execute("ALTER TABLE OKRs ADD COLUMN ActualValue REAL DEFAULT 0")
-        except: pass
-        try: c.execute("ALTER TABLE OKRs ADD COLUMN Unit TEXT DEFAULT ''")
-        except: pass
-        try: c.execute("ALTER TABLE OKRs ADD COLUMN DeleteRequest INTEGER DEFAULT 0")
-        except: pass
-
-        # 6. Bảng FinalReviews
-        c.execute('''CREATE TABLE IF NOT EXISTS FinalReviews (
-            Email_HocSinh TEXT,
-            ID_Dot INTEGER,
-            NhanXet_GV TEXT,
-            NhanXet_PH TEXT,
-            DaGui_PH INTEGER DEFAULT 0,
-            PRIMARY KEY (Email_HocSinh, ID_Dot)
-        )''')
-
-        # SEED DATA
-        c.execute("SELECT * FROM Users WHERE Email='admin@school.com'")
-        if not c.fetchone():
-            users = [
-                ('admin@school.com', '123', 'Quản Trị Viên', 'Admin', None),
-                ('gv1@school.com', '123', 'Cô Lan', 'GiaoVien', None),
-                ('hs1@school.com', '123', 'Em An', 'HocSinh', '12A1')
-            ]
-            for u in users:
-                c.execute("INSERT OR IGNORE INTO Users VALUES (?,?,?,?,?)", u)
-            conn.commit()
-
-        conn.close()
+def update_record(sheet_name, match_col, match_val, update_col, update_val, match_col_2=None, match_val_2=None):
+    """Cập nhật giá trị 1 ô dựa trên điều kiện tìm kiếm"""
+    ws = get_worksheet(sheet_name)
+    try:
+        # Tìm dòng cần sửa
+        cell = None
+        if match_col_2:
+            # Tìm kiếm 2 điều kiện (Khá chậm nếu dữ liệu lớn, nhưng chấp nhận được cho demo)
+            records = ws.get_all_records()
+            for i, r in enumerate(records):
+                # Lưu ý: records index bắt đầu từ 0 (tương ứng row 2 trong sheet)
+                if str(r[match_col]) == str(match_val) and str(r[match_col_2]) == str(match_val_2):
+                    row_idx = i + 2
+                    col_idx = ws.find(update_col).col
+                    ws.update_cell(row_idx, col_idx, update_val)
+                    break
+        else:
+            # Tìm kiếm 1 điều kiện (nhanh hơn)
+            cell = ws.find(str(match_val), in_column=ws.find(match_col).col)
+            if cell:
+                col_idx = ws.find(update_col).col
+                ws.update_cell(cell.row, col_idx, update_val)
+        
+        st.cache_data.clear()
     except Exception as e:
-        st.error(f"Lỗi khởi tạo DB: {e}")
+        print(f"Error update: {e}")
 
-init_and_migrate_db()
+def delete_record(sheet_name, match_col, match_val):
+    """Xóa dòng"""
+    ws = get_worksheet(sheet_name)
+    try:
+        cell = ws.find(str(match_val), in_column=ws.find(match_col).col)
+        if cell:
+            ws.delete_rows(cell.row)
+            st.cache_data.clear()
+    except:
+        pass
+
+def get_next_id(sheet_name):
+    """Lấy ID tiếp theo (Auto Increment giả lập)"""
+    df = load_data(sheet_name)
+    if df.empty: return 1
+    if 'ID' in df.columns:
+        return int(df['ID'].max()) + 1
+    return 1
+
+def upsert_final_review(email, id_dot, col_name, value):
+    """Hàm đặc biệt để Insert hoặc Update FinalReviews"""
+    df = load_data("FinalReviews")
+    exists = False
+    if not df.empty:
+        mask = (df['Email_HocSinh'] == email) & (df['ID_Dot'] == id_dot)
+        if not df[mask].empty:
+            exists = True
+    
+    if exists:
+        update_record("FinalReviews", "Email_HocSinh", email, col_name, value, "ID_Dot", id_dot)
+    else:
+        # Nếu chưa có thì tạo dòng mới, các cột khác để trống
+        row = [email, id_dot, "", "", 0]
+        # Xác định vị trí cột để điền đúng giá trị
+        if col_name == "NhanXet_GV": row[2] = value
+        elif col_name == "NhanXet_PH": row[3] = value
+        elif col_name == "DaGui_PH": row[4] = value
+        
+        add_record("FinalReviews", row)
 
 # ==============================================================================
 # TIỆN ÍCH (HELPER FUNCTIONS)
@@ -173,27 +211,16 @@ def change_password_ui(email):
             confirm_pass = st.text_input("Xác nhận mật khẩu mới", type="password")
             if st.form_submit_button("Cập nhật"):
                 if new_pass and new_pass == confirm_pass:
-                    conn = get_connection()
-                    conn.execute("UPDATE Users SET Password=? WHERE Email=?", (new_pass, email))
-                    conn.commit()
-                    conn.close()
+                    update_record("Users", "Email", email, "Password", new_pass)
                     st.success("Đổi mật khẩu thành công!")
                 else:
                     st.error("Mật khẩu không khớp.")
 
 def get_periods_map(role):
-    """
-    Lấy danh sách đợt.
-    - Admin: Lấy tất cả.
-    - GV, HS, PH: Chỉ lấy đợt 'Mo'.
-    """
-    conn = get_connection()
-    if role == 'Admin':
-        df = pd.read_sql("SELECT ID, TenDot, TrangThai FROM Periods", conn)
-    else:
-        df = pd.read_sql("SELECT ID, TenDot, TrangThai FROM Periods WHERE TrangThai='Mo'", conn)
-    conn.close()
+    df = load_data("Periods")
     if df.empty: return {}
+    if role != 'Admin':
+        df = df[df['TrangThai'] == 'Mo']
     return dict(zip(df['TenDot'], df['ID']))
 
 # ==============================================================================
@@ -207,13 +234,18 @@ def login_page():
         password = st.text_input("Mật khẩu", type="password")
         submitted = st.form_submit_button("Đăng nhập")
         if submitted:
-            conn = get_connection()
-            c = conn.cursor()
-            c.execute("SELECT * FROM Users WHERE Email=? AND Password=?", (email, password))
-            user = c.fetchone()
-            conn.close()
-            if user:
-                st.session_state['user'] = {'email': user[0], 'name': user[2], 'role': user[3], 'class_id': user[4]}
+            df_users = load_data("Users")
+            # Filter
+            user = df_users[(df_users['Email'] == email) & (df_users['Password'].astype(str) == str(password))]
+            
+            if not user.empty:
+                u = user.iloc[0]
+                st.session_state['user'] = {
+                    'email': u['Email'], 
+                    'name': u['HoTen'], 
+                    'role': u['VaiTro'], 
+                    'class_id': u['ClassID']
+                }
                 st.rerun()
             else:
                 st.error("Sai Email hoặc mật khẩu.")
@@ -221,7 +253,6 @@ def login_page():
 # --- 1. ADMIN DASHBOARD ---
 def admin_dashboard(period_id):
     st.header("🛠️ Dashboard Quản Trị Viên")
-    conn = get_connection()
     change_password_ui(st.session_state['user']['email'])
 
     tab1, tab2, tab3 = st.tabs(["Quản lý Lớp & Thống kê", "Quản lý User", "Quản lý Đợt"])
@@ -230,30 +261,39 @@ def admin_dashboard(period_id):
     with tab1:
         st.subheader(f"📊 Thống kê Lớp học - Đợt ID: {period_id}")
         
-        # Lấy danh sách lớp
-        classes = pd.read_sql("SELECT * FROM Classes", conn)
+        classes = load_data("Classes")
         
         if classes.empty:
             st.info("Chưa có lớp học nào.")
         else:
             stats_data = []
+            reviews = load_data("FinalReviews")
+            
             for _, cl in classes.iterrows():
-                siso = cl['SiSo']
-                q_approved = f"""
-                    SELECT COUNT(DISTINCT FinalReviews.Email_HocSinh)
-                    FROM FinalReviews 
-                    JOIN Users ON FinalReviews.Email_HocSinh = Users.Email
-                    WHERE Users.ClassID = '{cl['ID']}' AND FinalReviews.ID_Dot = {period_id} 
-                    AND FinalReviews.NhanXet_GV IS NOT NULL AND FinalReviews.NhanXet_GV != ''
-                """
-                approved_count = pd.read_sql(q_approved, conn).iloc[0,0]
+                siso = float(cl['SiSo'])
+                
+                # Logic: Đếm số HS trong lớp đã có nhận xét GV trong đợt này
+                # 1. Lấy tất cả HS của lớp
+                all_users = load_data("Users")
+                class_users = all_users[all_users['ClassID'] == cl['ID']]['Email'].tolist()
+                
+                # 2. Đếm trong FinalReviews
+                if not reviews.empty and class_users:
+                    approved_count = reviews[
+                        (reviews['ID_Dot'] == period_id) & 
+                        (reviews['Email_HocSinh'].isin(class_users)) & 
+                        (reviews['NhanXet_GV'] != "")
+                    ].shape[0]
+                else:
+                    approved_count = 0
+
                 pct_approved = round((approved_count / siso * 100), 1) if siso > 0 else 0
                 
                 stats_data.append({
                     "ID Lớp": cl['ID'],
                     "Tên Lớp": cl['TenLop'],
                     "GVCN": cl['EmailGVCN'],
-                    "Sĩ Số": siso,
+                    "Sĩ Số": int(siso),
                     "Đã Duyệt Tổng Kết (%)": f"{pct_approved}%",
                     "Chưa Duyệt (%)": f"{100 - pct_approved}%"
                 })
@@ -271,14 +311,13 @@ def admin_dashboard(period_id):
                     if c_name and c_gv:
                         gen_id = f"{c_name}_{int(time.time())}"
                         try:
-                            conn.execute("INSERT INTO Classes (ID, TenLop, EmailGVCN, SiSo) VALUES (?,?,?,?)", 
-                                         (gen_id, c_name, c_gv, c_siso))
-                            cursor = conn.cursor()
-                            cursor.execute("SELECT 1 FROM Users WHERE Email=?", (c_gv,))
-                            if not cursor.fetchone():
-                                conn.execute("INSERT INTO Users (Email, Password, HoTen, VaiTro) VALUES (?, ?, ?, 'GiaoVien')",
-                                             (c_gv, '123', f"GV ({c_name})"))
-                            conn.commit()
+                            add_record("Classes", [gen_id, c_name, c_gv, c_siso])
+                            
+                            # Check GV exist
+                            users = load_data("Users")
+                            if users[users['Email'] == c_gv].empty:
+                                add_record("Users", [c_gv, "123", f"GV ({c_name})", "GiaoVien", ""])
+                                
                             st.success(f"Đã tạo lớp {c_name}!")
                             st.rerun()
                         except Exception as e:
@@ -291,24 +330,23 @@ def admin_dashboard(period_id):
                     c1, c2 = st.columns([3, 1])
                     c1.write(f"**{cl['TenLop']}** - GV: {cl['EmailGVCN']}")
                     if c2.button("🚀 Cấp TK", key=f"grant_{cl['ID']}"):
-                        conn.execute("UPDATE Users SET Password='123' WHERE Email=?", (cl['EmailGVCN'],))
-                        conn.commit()
+                        update_record("Users", "Email", cl['EmailGVCN'], "Password", "123")
                         st.toast(f"Đã kích hoạt tài khoản cho GV: {cl['EmailGVCN']} (Pass: 123)")
 
     with tab2:
         st.subheader("Quản lý User")
         search = st.text_input("Tìm Email:")
         if search:
-            u = pd.read_sql("SELECT * FROM Users WHERE Email=?", conn, params=(search,))
+            users = load_data("Users")
+            u = users[users['Email'] == search]
             st.write(u)
             if not u.empty and st.button("Reset Pass"):
-                conn.execute("UPDATE Users SET Password='123' WHERE Email=?", (search,))
-                conn.commit()
+                update_record("Users", "Email", search, "Password", "123")
                 st.success("Đã reset về 123")
 
     with tab3:
         st.subheader("Quản lý Đợt")
-        periods = pd.read_sql("SELECT * FROM Periods", conn)
+        periods = load_data("Periods")
         for i, row in periods.iterrows():
             c_tog, c_del = st.columns([4, 1])
             with c_tog:
@@ -316,36 +354,32 @@ def admin_dashboard(period_id):
                 toggle = st.toggle(f"{row['TenDot']} (ID: {row['ID']})", value=is_open, key=f"p_{row['ID']}")
                 new_st = 'Mo' if toggle else 'Khoa'
                 if new_st != row['TrangThai']:
-                    conn.execute("UPDATE Periods SET TrangThai=? WHERE ID=?", (new_st, row['ID']))
-                    conn.commit()
+                    update_record("Periods", "ID", row['ID'], "TrangThai", new_st)
                     st.rerun()
             with c_del:
                 if st.button("🗑️", key=f"del_p_{row['ID']}"):
-                    conn.execute("DELETE FROM Periods WHERE ID=?", (row['ID'],))
-                    conn.commit()
+                    delete_record("Periods", "ID", row['ID'])
                     st.warning(f"Đã xóa đợt: {row['TenDot']}")
                     st.rerun()
         
         with st.form("new_period"):
             p_name = st.text_input("Tên đợt mới")
             if st.form_submit_button("Thêm"):
-                conn.execute("INSERT INTO Periods (TenDot, TrangThai) VALUES (?, 'Mo')", (p_name,))
-                conn.commit()
+                next_id = get_next_id("Periods")
+                add_record("Periods", [next_id, p_name, 'Mo'])
                 st.rerun()
-    
-    conn.close()
 
 # --- 2. TEACHER DASHBOARD ---
 def teacher_dashboard(period_id):
     user_email = st.session_state['user']['email']
     st.header(f"🍎 Giáo Viên: {st.session_state['user']['name']}")
     change_password_ui(user_email)
-    conn = get_connection()
     
-    my_class = pd.read_sql("SELECT * FROM Classes WHERE EmailGVCN=?", conn, params=(user_email,))
+    classes = load_data("Classes")
+    my_class = classes[classes['EmailGVCN'] == user_email]
+    
     if my_class.empty:
         st.warning("Bạn chưa được phân công lớp.")
-        conn.close()
         return
 
     class_id = my_class.iloc[0]['ID']
@@ -356,13 +390,12 @@ def teacher_dashboard(period_id):
     with tab1:
         st.subheader("📋 Trạng thái OKR Học sinh")
         
-        # Danh sách HS
-        students = pd.read_sql("SELECT Email, HoTen FROM Users WHERE ClassID=?", conn, params=(class_id,))
+        users = load_data("Users")
+        students = users[users['ClassID'] == class_id]
         
         if students.empty:
             st.write("Lớp chưa có học sinh.")
         else:
-            # Header
             cols = st.columns([0.5, 2, 1.5, 1.5, 1])
             cols[0].markdown("**STT**")
             cols[1].markdown("**Họ Tên**")
@@ -370,35 +403,47 @@ def teacher_dashboard(period_id):
             cols[3].markdown("**Duyệt Lần 2 (Tổng Kết)**")
             cols[4].markdown("**Hành động**")
             
+            all_okrs = load_data("OKRs")
+            all_reviews = load_data("FinalReviews")
+
             for idx, hs in students.iterrows():
-                # Logic xác định trạng thái Lần 1 (Mục tiêu)
-                okrs = pd.read_sql("SELECT TrangThai, DeleteRequest FROM OKRs WHERE Email_HocSinh=? AND ID_Dot=?", conn, params=(hs['Email'], period_id))
-                
+                # Filter OKRs
+                if not all_okrs.empty:
+                    hs_okrs = all_okrs[(all_okrs['Email_HocSinh'] == hs['Email']) & (all_okrs['ID_Dot'] == period_id)]
+                else:
+                    hs_okrs = pd.DataFrame()
+
+                # Status L1
                 l1_status = ""
                 l1_badge = ""
                 
-                if okrs.empty:
+                if hs_okrs.empty:
                     l1_status = "Chưa tạo"
                     l1_badge = "badge-red"
                 else:
-                    pending_count = okrs[okrs['TrangThai'] == 'ChoDuyet'].shape[0]
-                    if pending_count > 0:
+                    pending = hs_okrs[hs_okrs['TrangThai'] == 'ChoDuyet']
+                    if not pending.empty:
                         l1_status = "Chờ duyệt"
                         l1_badge = "badge-yellow"
                     else:
                         l1_status = "Đã duyệt"
                         l1_badge = "badge-green"
 
-                # Logic xác định trạng thái Lần 2 (Tổng kết)
-                fr = pd.read_sql("SELECT * FROM FinalReviews WHERE Email_HocSinh=? AND ID_Dot=? AND NhanXet_GV IS NOT NULL AND NhanXet_GV != ''", 
-                                         conn, params=(hs['Email'], period_id))
-                has_final_review = not fr.empty
+                # Status L2
+                has_final = False
+                if not all_reviews.empty:
+                    rev = all_reviews[(all_reviews['Email_HocSinh'] == hs['Email']) & (all_reviews['ID_Dot'] == period_id)]
+                    if not rev.empty and rev.iloc[0]['NhanXet_GV'] != "":
+                        has_final = True
                 
-                l2_status = "Đã xong" if has_final_review else "Chưa xong"
-                l2_badge = "badge-green" if has_final_review else "badge-grey"
+                l2_status = "Đã xong" if has_final else "Chưa xong"
+                l2_badge = "badge-green" if has_final else "badge-grey"
                 
-                # Check yêu cầu xóa
-                has_del_req = not okrs[okrs['DeleteRequest'] == 1].empty
+                # Check delete req
+                has_del_req = False
+                if not hs_okrs.empty:
+                    if not hs_okrs[hs_okrs['DeleteRequest'] == 1].empty:
+                        has_del_req = True
                 
                 with st.container():
                     c = st.columns([0.5, 2, 1.5, 1.5, 1])
@@ -413,7 +458,7 @@ def teacher_dashboard(period_id):
                     c[3].markdown(f'<span class="status-badge {l2_badge}">{l2_status}</span>', unsafe_allow_html=True)
                     
                     if c[4].button("Chi tiết", key=f"view_{hs['Email']}"):
-                        st.session_state['selected_hs'] = hs
+                        st.session_state['selected_hs'] = hs.to_dict()
                         st.rerun()
 
             st.divider()
@@ -423,7 +468,10 @@ def teacher_dashboard(period_id):
                 hs_curr = st.session_state['selected_hs']
                 st.markdown(f"### 📝 Chi tiết: {hs_curr['HoTen']}")
                 
-                df_okr = pd.read_sql("SELECT * FROM OKRs WHERE Email_HocSinh=? AND ID_Dot=?", conn, params=(hs_curr['Email'], period_id))
+                if not all_okrs.empty:
+                    df_okr = all_okrs[(all_okrs['Email_HocSinh'] == hs_curr['Email']) & (all_okrs['ID_Dot'] == period_id)]
+                else:
+                    df_okr = pd.DataFrame()
                 
                 if df_okr.empty:
                     st.warning("Học sinh này chưa nhập OKR nào.")
@@ -432,7 +480,6 @@ def teacher_dashboard(period_id):
                         with st.container(border=True):
                             c1, c2, c3 = st.columns([4, 2, 2])
                             
-                            bg_color = ""
                             if row['DeleteRequest'] == 1:
                                 st.error(f"⚠️ Học sinh yêu cầu xóa mục tiêu: {row['MucTieu']} - {row['KetQuaThenChot']}")
                             
@@ -449,48 +496,37 @@ def teacher_dashboard(period_id):
                                 # Xử lý duyệt Lần 1
                                 if row['TrangThai'] == 'ChoDuyet':
                                     if st.button("✅ Duyệt Mục Tiêu", key=f"app_{row['ID']}"):
-                                        conn.execute("UPDATE OKRs SET TrangThai='DaDuyetMucTieu' WHERE ID=?", (row['ID'],))
-                                        conn.commit()
+                                        update_record("OKRs", "ID", row['ID'], "TrangThai", "DaDuyetMucTieu")
                                         st.rerun()
                                 
                                 # Xử lý Yêu cầu xóa
                                 if row['DeleteRequest'] == 1:
                                     if st.button("🗑️ Chấp thuận xóa", key=f"del_{row['ID']}"):
-                                        conn.execute("DELETE FROM OKRs WHERE ID=?", (row['ID'],))
-                                        conn.commit()
+                                        delete_record("OKRs", "ID", row['ID'])
                                         st.rerun()
 
                     # Duyệt Tổng Kết (Lần 2) & Xem ý kiến gia đình
                     st.write("---")
                     
-                    fr = pd.read_sql("SELECT * FROM FinalReviews WHERE Email_HocSinh=? AND ID_Dot=?", conn, params=(hs_curr['Email'], period_id))
-                    old_cmt_gv = fr.iloc[0]['NhanXet_GV'] if not fr.empty else ""
-                    cmt_ph = fr.iloc[0]['NhanXet_PH'] if not fr.empty else None
+                    old_cmt_gv = ""
+                    cmt_ph = None
+                    if not all_reviews.empty:
+                        rev = all_reviews[(all_reviews['Email_HocSinh'] == hs_curr['Email']) & (all_reviews['ID_Dot'] == period_id)]
+                        if not rev.empty:
+                            old_cmt_gv = rev.iloc[0]['NhanXet_GV']
+                            if rev.iloc[0]['NhanXet_PH']:
+                                cmt_ph = rev.iloc[0]['NhanXet_PH']
                     
-                    # Hiển thị Ý kiến gia đình
                     if cmt_ph:
                         st.info(f"🏠 **Ý kiến gia đình:** {cmt_ph}")
                     else:
                         st.caption("🏠 Gia đình chưa gửi ý kiến.")
 
-                    # Form GV nhập nhận xét
                     st.write("**Đánh giá cuối kỳ (Final Review):**")
                     with st.form("teacher_review"):
                         cmt = st.text_area("Nhận xét giáo viên:", value=old_cmt_gv)
                         if st.form_submit_button("Lưu & Hoàn tất Duyệt Lần 2"):
-                            conn.execute("INSERT OR REPLACE INTO FinalReviews (Email_HocSinh, ID_Dot, NhanXet_GV) VALUES (?,?,?)",
-                                         (hs_curr['Email'], period_id, cmt))
-                            # Giữ lại NhanXet_PH nếu có (logic REPLACE của SQLite có thể xóa cột khác nếu không khai báo đủ)
-                            # Nên dùng UPDATE hoặc INSERT OR IGNORE + UPDATE
-                            # Safe Update Logic:
-                            cursor = conn.cursor()
-                            cursor.execute("SELECT 1 FROM FinalReviews WHERE Email_HocSinh=? AND ID_Dot=?", (hs_curr['Email'], period_id))
-                            if cursor.fetchone():
-                                conn.execute("UPDATE FinalReviews SET NhanXet_GV=? WHERE Email_HocSinh=? AND ID_Dot=?", (cmt, hs_curr['Email'], period_id))
-                            else:
-                                conn.execute("INSERT INTO FinalReviews (Email_HocSinh, ID_Dot, NhanXet_GV) VALUES (?,?,?)", (hs_curr['Email'], period_id, cmt))
-                                
-                            conn.commit()
+                            upsert_final_review(hs_curr['Email'], period_id, "NhanXet_GV", cmt)
                             st.success("Đã lưu nhận xét!")
 
     with tab2:
@@ -501,29 +537,40 @@ def teacher_dashboard(period_id):
             try:
                 df = pd.read_excel(upl)
                 count = 0
+                all_users = load_data("Users")
+                all_rels = load_data("Relationships")
+                
                 for _, r in df.iterrows():
                     # Thêm HS
-                    conn.execute("INSERT OR IGNORE INTO Users (Email, Password, HoTen, VaiTro, ClassID) VALUES (?,?,?,?,?)",
-                                 (r['Email'], '123', r['HoTen'], 'HocSinh', class_id))
-                    # Thêm PH
+                    if all_users.empty or r['Email'] not in all_users['Email'].values:
+                         add_record("Users", [r['Email'], '123', r['HoTen'], 'HocSinh', class_id])
+
+                    # Thêm PH & Rel
                     if pd.notna(r['EmailPH']):
-                        conn.execute("INSERT OR IGNORE INTO Users (Email, Password, HoTen, VaiTro) VALUES (?,?,'Phụ Huynh','PhuHuynh')",
-                                     (str(r['EmailPH']), '123'))
-                        conn.execute("INSERT OR REPLACE INTO Relationships VALUES (?,?)", (r['Email'], str(r['EmailPH'])))
+                        ph_email = str(r['EmailPH'])
+                        if all_users.empty or ph_email not in all_users['Email'].values:
+                            add_record("Users", [ph_email, '123', 'Phụ Huynh', 'PhuHuynh', ''])
+                        
+                        # Check rel exist
+                        rel_exists = False
+                        if not all_rels.empty:
+                            mask = (all_rels['Email_HocSinh'] == r['Email']) & (all_rels['Email_PhuHuynh'] == ph_email)
+                            if not all_rels[mask].empty:
+                                rel_exists = True
+                        
+                        if not rel_exists:
+                            add_record("Relationships", [r['Email'], ph_email])
+
                     count += 1
-                conn.commit()
                 st.success(f"Đã import {count} dòng.")
             except Exception as e:
                 st.error(str(e))
-                
-    conn.close()
 
 # --- 3. STUDENT DASHBOARD ---
 def student_dashboard(period_id):
     user_email = st.session_state['user']['email']
     st.header(f"🎒 Góc Học Tập: {st.session_state['user']['name']}")
     change_password_ui(user_email)
-    conn = get_connection()
     
     # 1. NHẬP LIỆU
     with st.expander("➕ Thêm Mục tiêu & Kết quả (OKR)", expanded=True):
@@ -537,11 +584,9 @@ def student_dashboard(period_id):
             
             if st.form_submit_button("Lưu OKR"):
                 if mt and kr:
-                    conn.execute("""
-                        INSERT INTO OKRs (Email_HocSinh, ID_Dot, MucTieu, KetQuaThenChot, TargetValue, Unit, ActualValue, TrangThai, DeleteRequest)
-                        VALUES (?,?,?,?,?,?,0,'ChoDuyet',0)
-                    """, (user_email, period_id, mt, kr, target, unit))
-                    conn.commit()
+                    next_id = get_next_id("OKRs")
+                    # ID, Email_HocSinh, ID_Dot, MucTieu, KetQuaThenChot, TienDo, TrangThai, NhanXet_GV, NhanXet_PH, MinhChung, TargetValue, ActualValue, Unit, DeleteRequest
+                    add_record("OKRs", [next_id, user_email, period_id, mt, kr, 0, 'ChoDuyet', '', '', '', target, 0, unit, 0])
                     st.success("Đã thêm!")
                     st.rerun()
 
@@ -549,21 +594,21 @@ def student_dashboard(period_id):
     st.divider()
     st.subheader("📋 OKR của tôi")
     
-    df_okrs = pd.read_sql("SELECT * FROM OKRs WHERE Email_HocSinh=? AND ID_Dot=?", conn, params=(user_email, period_id))
+    all_okrs = load_data("OKRs")
+    if not all_okrs.empty:
+        df_okrs = all_okrs[(all_okrs['Email_HocSinh'] == user_email) & (all_okrs['ID_Dot'] == period_id)]
+    else:
+        df_okrs = pd.DataFrame()
     
     if df_okrs.empty:
         st.info("Chưa có dữ liệu.")
     else:
-        # Group by Objective
         unique_objs = df_okrs['MucTieu'].unique()
-        
         total_pct = 0
         count_kr = 0
         
         for obj in unique_objs:
             st.markdown(f"#### 🎯 O: {obj}")
-            
-            # Get KRs for this Objective
             krs = df_okrs[df_okrs['MucTieu'] == obj]
             
             for _, row in krs.iterrows():
@@ -590,22 +635,19 @@ def student_dashboard(period_id):
                             with st.form(f"upd_{row['ID']}"):
                                 new_val = st.number_input("Đạt được:", value=float(row['ActualValue']))
                                 if st.form_submit_button("Lưu"):
-                                    conn.execute("UPDATE OKRs SET ActualValue=? WHERE ID=?", (new_val, row['ID']))
-                                    conn.commit()
+                                    update_record("OKRs", "ID", row['ID'], "ActualValue", new_val)
                                     st.rerun()
                     
                     # Delete Request
                     with c4:
                         if row['TrangThai'] == 'ChoDuyet':
                             if st.button("🗑️", key=f"del_{row['ID']}"):
-                                conn.execute("DELETE FROM OKRs WHERE ID=?", (row['ID'],))
-                                conn.commit()
+                                delete_record("OKRs", "ID", row['ID'])
                                 st.rerun()
                         else:
                             if row['DeleteRequest'] == 0:
                                 if st.button("Xin xóa", key=f"req_{row['ID']}"):
-                                    conn.execute("UPDATE OKRs SET DeleteRequest=1 WHERE ID=?", (row['ID'],))
-                                    conn.commit()
+                                    update_record("OKRs", "ID", row['ID'], "DeleteRequest", 1)
                                     st.rerun()
                             else:
                                 st.caption("Đang chờ xóa")
@@ -617,7 +659,10 @@ def student_dashboard(period_id):
         st.markdown(f"### 🏁 Tổng kết: <span style='color:{color}'>{final_score}% - {rank}</span>", unsafe_allow_html=True)
         
         # Xem Nhận xét (GV & PH)
-        fr = pd.read_sql("SELECT * FROM FinalReviews WHERE Email_HocSinh=? AND ID_Dot=?", conn, params=(user_email, period_id))
+        all_reviews = load_data("FinalReviews")
+        fr = pd.DataFrame()
+        if not all_reviews.empty:
+            fr = all_reviews[(all_reviews['Email_HocSinh'] == user_email) & (all_reviews['ID_Dot'] == period_id)]
         
         col1, col2 = st.columns(2)
         with col1:
@@ -634,27 +679,33 @@ def student_dashboard(period_id):
             else:
                 st.caption("Gia đình chưa có ý kiến.")
 
-    conn.close()
-
 # --- 4. PARENT DASHBOARD ---
 def parent_dashboard(period_id):
     user_email = st.session_state['user']['email']
     st.header("👨‍👩‍👧‍👦 Phụ Huynh")
     change_password_ui(user_email)
-    conn = get_connection()
     
-    child = pd.read_sql("SELECT Email_HocSinh FROM Relationships WHERE Email_PhuHuynh=?", conn, params=(user_email,))
-    if child.empty:
+    rels = load_data("Relationships")
+    if rels.empty:
         st.warning("Chưa liên kết học sinh.")
-        conn.close()
         return
         
-    child_email = child.iloc[0]['Email_HocSinh']
-    child_info = pd.read_sql("SELECT HoTen, ClassID FROM Users WHERE Email=?", conn, params=(child_email,))
-    st.info(f"Con: {child_info.iloc[0]['HoTen']} - Lớp: {child_info.iloc[0]['ClassID']}")
+    my_child = rels[rels['Email_PhuHuynh'] == user_email]
+    if my_child.empty:
+        st.warning("Chưa liên kết học sinh.")
+        return
+        
+    child_email = my_child.iloc[0]['Email_HocSinh']
+    
+    users = load_data("Users")
+    child_info = users[users['Email'] == child_email].iloc[0]
+    st.info(f"Con: {child_info['HoTen']} - Lớp: {child_info['ClassID']}")
     
     # Hiển thị OKR
-    df_okr = pd.read_sql("SELECT * FROM OKRs WHERE Email_HocSinh=? AND ID_Dot=?", conn, params=(child_email, period_id))
+    all_okrs = load_data("OKRs")
+    df_okr = pd.DataFrame()
+    if not all_okrs.empty:
+        df_okr = all_okrs[(all_okrs['Email_HocSinh'] == child_email) & (all_okrs['ID_Dot'] == period_id)]
     
     if df_okr.empty:
         st.info("Con chưa có dữ liệu đợt này.")
@@ -675,7 +726,10 @@ def parent_dashboard(period_id):
         # Nhận xét
         st.divider()
         col1, col2 = st.columns(2)
-        fr = pd.read_sql("SELECT * FROM FinalReviews WHERE Email_HocSinh=? AND ID_Dot=?", conn, params=(child_email, period_id))
+        all_reviews = load_data("FinalReviews")
+        fr = pd.DataFrame()
+        if not all_reviews.empty:
+            fr = all_reviews[(all_reviews['Email_HocSinh'] == child_email) & (all_reviews['ID_Dot'] == period_id)]
         
         with col1:
             st.write("**Giáo viên:**")
@@ -687,7 +741,7 @@ def parent_dashboard(period_id):
         with col2:
             st.write("**Gia đình:**")
             cmt_ph = fr.iloc[0]['NhanXet_PH'] if not fr.empty else ""
-            sent = fr.iloc[0]['DaGui_PH'] if not fr.empty and pd.notna(fr.iloc[0]['DaGui_PH']) else 0
+            sent = fr.iloc[0]['DaGui_PH'] if not fr.empty else 0
             
             if sent == 1:
                 st.success(f"Đã gửi: {cmt_ph}")
@@ -695,17 +749,9 @@ def parent_dashboard(period_id):
                 with st.form("ph_cmt"):
                     txt = st.text_area("Ý kiến:", value=cmt_ph)
                     if st.form_submit_button("Gửi"):
-                        # Insert/Update logic safe
-                        cursor = conn.cursor()
-                        cursor.execute("SELECT 1 FROM FinalReviews WHERE Email_HocSinh=? AND ID_Dot=?", (child_email, period_id))
-                        if cursor.fetchone():
-                            conn.execute("UPDATE FinalReviews SET NhanXet_PH=?, DaGui_PH=1 WHERE Email_HocSinh=? AND ID_Dot=?", (txt, child_email, period_id))
-                        else:
-                            conn.execute("INSERT INTO FinalReviews (Email_HocSinh, ID_Dot, NhanXet_PH, DaGui_PH) VALUES (?,?,?,1)", 
-                                         (child_email, period_id, txt))
-                        conn.commit()
+                        upsert_final_review(child_email, period_id, "NhanXet_PH", txt)
+                        upsert_final_review(child_email, period_id, "DaGui_PH", 1)
                         st.rerun()
-    conn.close()
 
 # ==============================================================================
 # MAIN ROUTING
@@ -723,34 +769,3 @@ def main():
             
             st.divider()
             st.write("📅 **Chọn Đợt (Học kỳ):**")
-            
-            # Lọc đợt theo vai trò
-            periods_map = get_periods_map(role)
-            
-            if periods_map:
-                selected_period_name = st.selectbox("Danh sách đợt:", list(periods_map.keys()))
-                selected_period_id = periods_map[selected_period_name]
-            else:
-                st.warning("Chưa có Đợt nào khả dụng.")
-                selected_period_id = None
-            
-            st.divider()
-            if st.button("Đăng xuất"):
-                for key in list(st.session_state.keys()):
-                    del st.session_state[key]
-                st.rerun()
-
-        # ROUTING
-        if selected_period_id:
-            if role == 'Admin': admin_dashboard(selected_period_id)
-            elif role == 'GiaoVien': teacher_dashboard(selected_period_id)
-            elif role == 'HocSinh': student_dashboard(selected_period_id)
-            elif role == 'PhuHuynh': parent_dashboard(selected_period_id)
-        else:
-            if role == 'Admin':
-                admin_dashboard(0) # Cho vào để tạo đợt
-            else:
-                st.info("Hiện không có đợt nhập liệu nào đang mở.")
-
-if __name__ == "__main__":
-    main()
