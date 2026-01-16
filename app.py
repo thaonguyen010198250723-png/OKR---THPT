@@ -6,12 +6,17 @@ import json
 import unicodedata
 from fpdf import FPDF
 import time
+from docx import Document
+from docx.shared import Inches, Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+import io
+import matplotlib.pyplot as plt
 
 # ==============================================================================
 # CẤU HÌNH TRANG & GIAO DIỆN (THEME)
 # ==============================================================================
 st.set_page_config(
-    page_title="Hệ thống Quản lý OKR Trường học (GSheets V3)",
+    page_title="Hệ thống Quản lý OKR Trường học (V6 - Word & Batch Import)",
     page_icon="🎓",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -64,11 +69,14 @@ def get_worksheet(sheet_name):
     client = init_connection()
     if not client: return None
     
-    sh = client.open_by_key(SHEET_ID)
     try:
+        sh = client.open_by_key(SHEET_ID)
         return sh.worksheet(sheet_name)
     except gspread.WorksheetNotFound:
+        # Nếu chưa có thì tạo mới
+        sh = client.open_by_key(SHEET_ID)
         ws = sh.add_worksheet(title=sheet_name, rows=100, cols=20)
+        # Header mặc định
         if sheet_name == "Users":
             ws.append_row(["Email", "Password", "HoTen", "VaiTro", "TenLop"])
             ws.append_row(["admin@school.com", "123", "Quản Trị Viên", "Admin", ""])
@@ -83,8 +91,11 @@ def get_worksheet(sheet_name):
         elif sheet_name == "FinalReviews":
             ws.append_row(["Email_HocSinh", "ID_Dot", "NhanXet_GV", "NhanXet_PH", "DaGui_PH"])
         return ws
+    except Exception as e: # Catch API Errors like 429 here globally if needed
+        st.error(f"Lỗi truy cập dữ liệu (Có thể do quá tải): {e}")
+        return None
 
-# --- CÁC HÀM CRUD ---
+# --- CÁC HÀM CRUD (CREATE, READ, UPDATE, DELETE) ---
 
 @st.cache_data(ttl=10)
 def load_data(sheet_name):
@@ -92,33 +103,35 @@ def load_data(sheet_name):
     ws = get_worksheet(sheet_name)
     if not ws: return pd.DataFrame()
     
-    data = ws.get_all_records()
-    df = pd.DataFrame(data)
+    try:
+        data = ws.get_all_records()
+        df = pd.DataFrame(data)
+    except Exception as e:
+        st.warning(f"Đang tải lại dữ liệu... ({e})")
+        time.sleep(2)
+        return pd.DataFrame() # Return empty temporarily
     
-    # Map cột cũ sang mới nếu cần
+    # Fix cột Users
     if sheet_name == "Users":
         if 'ClassID' in df.columns and 'TenLop' not in df.columns:
             df = df.rename(columns={'ClassID': 'TenLop'})
         if 'TenLop' not in df.columns:
             df['TenLop'] = ""
 
+    # Fix cột Classes
     if sheet_name == "Classes":
         if 'TenLop' not in df.columns and 'ID' in df.columns:
              df['TenLop'] = df['ID']
 
-    # Xử lý kiểu dữ liệu số
+    # Xử lý numeric
     if sheet_name == "OKRs" and not df.empty:
-        if 'ID' in df.columns: df['ID'] = pd.to_numeric(df['ID'], errors='coerce')
-        if 'ID_Dot' in df.columns: df['ID_Dot'] = pd.to_numeric(df['ID_Dot'], errors='coerce')
-        if 'TargetValue' in df.columns: df['TargetValue'] = pd.to_numeric(df['TargetValue'], errors='coerce').fillna(0)
-        if 'ActualValue' in df.columns: df['ActualValue'] = pd.to_numeric(df['ActualValue'], errors='coerce').fillna(0)
-        if 'DeleteRequest' in df.columns: df['DeleteRequest'] = pd.to_numeric(df['DeleteRequest'], errors='coerce').fillna(0)
+        cols = ['ID', 'ID_Dot', 'TargetValue', 'ActualValue', 'DeleteRequest']
+        for c in cols:
+            if c in df.columns: df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
 
     if sheet_name == "Periods" and not df.empty:
-        if 'ID' in df.columns:
-            df['ID'] = pd.to_numeric(df['ID'], errors='coerce')
-        else:
-            df['ID'] = df.index + 1
+        if 'ID' in df.columns: df['ID'] = pd.to_numeric(df['ID'], errors='coerce')
+        else: df['ID'] = df.index + 1
             
     if sheet_name == "Classes" and not df.empty:
         if 'SiSo' in df.columns: df['SiSo'] = pd.to_numeric(df['SiSo'], errors='coerce').fillna(0)
@@ -132,8 +145,24 @@ def load_data(sheet_name):
 def add_record(sheet_name, row_data):
     ws = get_worksheet(sheet_name)
     if ws:
-        ws.append_row(row_data)
-        st.cache_data.clear()
+        try:
+            ws.append_row(row_data)
+            st.cache_data.clear()
+        except Exception as e:
+            st.error(f"Lỗi ghi dữ liệu: {e}")
+
+def batch_add_records(sheet_name, rows_data):
+    """Hàm thêm nhiều dòng cùng lúc (Tối ưu API)"""
+    ws = get_worksheet(sheet_name)
+    if ws and rows_data:
+        try:
+            ws.append_rows(rows_data)
+            st.cache_data.clear()
+            return True
+        except Exception as e:
+            st.error(f"Lỗi Batch Import: {e}. Vui lòng thử lại sau 1 phút.")
+            return False
+    return False
 
 def update_record(sheet_name, match_col, match_val, update_col, update_val, match_col_2=None, match_val_2=None):
     ws = get_worksheet(sheet_name)
@@ -150,7 +179,6 @@ def update_record(sheet_name, match_col, match_val, update_col, update_val, matc
             for i, r in enumerate(records):
                 val1 = str(r.get(real_match_col, r.get(match_col, '')))
                 val2 = str(r.get(match_col_2, ''))
-                
                 if val1 == str(match_val) and val2 == str(match_val_2):
                     row_idx = i + 2
                     col_idx = ws.find(update_col).col
@@ -165,7 +193,7 @@ def update_record(sheet_name, match_col, match_val, update_col, update_val, matc
                 ws.update_cell(cell.row, col_idx, update_val)
         st.cache_data.clear()
     except Exception as e:
-        print(f"Error update: {e}")
+        st.error(f"Lỗi cập nhật: {e}")
 
 def delete_record(sheet_name, match_col, match_val):
     ws = get_worksheet(sheet_name)
@@ -175,8 +203,8 @@ def delete_record(sheet_name, match_col, match_val):
         if cell:
             ws.delete_rows(cell.row)
             st.cache_data.clear()
-    except:
-        pass
+    except Exception as e:
+        st.error(f"Lỗi xóa: {e}")
 
 def get_next_id(sheet_name):
     df = load_data(sheet_name)
@@ -203,7 +231,7 @@ def upsert_final_review(email, id_dot, col_name, value):
         add_record("FinalReviews", row)
 
 # ==============================================================================
-# TIỆN ÍCH
+# TIỆN ÍCH & LOGIC BÁO CÁO WORD
 # ==============================================================================
 
 def remove_accents(input_str):
@@ -225,6 +253,71 @@ def get_rank(percent):
     elif percent >= 50: return "Đạt", "orange"
     return "Chưa đạt", "red"
 
+def create_docx(student_name, class_name, period_name, okr_df, review_gv, review_ph):
+    """Tạo báo cáo Word .docx"""
+    doc = Document()
+    
+    # Title
+    heading = doc.add_heading(f'BÁO CÁO KẾT QUẢ OKR', 0)
+    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    # Info
+    doc.add_paragraph(f'Họ tên học sinh: {student_name}')
+    doc.add_paragraph(f'Lớp: {class_name}')
+    doc.add_paragraph(f'Đợt đánh giá: {period_name}')
+    doc.add_paragraph(f'Ngày xuất báo cáo: {time.strftime("%d/%m/%Y")}')
+    doc.add_paragraph('--------------------------------------------------')
+
+    # OKR Table
+    doc.add_heading('1. Chi tiết Mục tiêu & Kết quả', level=1)
+    
+    if not okr_df.empty:
+        table = doc.add_table(rows=1, cols=5)
+        table.style = 'Table Grid'
+        hdr_cells = table.rows[0].cells
+        hdr_cells[0].text = 'Mục Tiêu (Objective)'
+        hdr_cells[1].text = 'Kết Quả (KR)'
+        hdr_cells[2].text = 'Mục Tiêu Số'
+        hdr_cells[3].text = 'Thực Đạt'
+        hdr_cells[4].text = 'Hoàn Thành (%)'
+        
+        total_pct = 0
+        count = 0
+        
+        for _, row in okr_df.iterrows():
+            row_cells = table.add_row().cells
+            row_cells[0].text = str(row['MucTieu'])
+            row_cells[1].text = str(row['KetQuaThenChot'])
+            row_cells[2].text = f"{row['TargetValue']} {row['Unit']}"
+            row_cells[3].text = f"{row['ActualValue']} {row['Unit']}"
+            
+            pct = calculate_percent(row['ActualValue'], row['TargetValue'])
+            row_cells[4].text = f"{pct}%"
+            total_pct += pct
+            count += 1
+            
+        avg = round(total_pct / count, 1) if count > 0 else 0
+        rank_txt, _ = get_rank(avg)
+        
+        doc.add_paragraph(f'\nTrung bình hoàn thành: {avg}%')
+        doc.add_paragraph(f'Xếp loại: {rank_txt}')
+    else:
+        doc.add_paragraph('Chưa có dữ liệu OKR.')
+
+    # Reviews
+    doc.add_heading('2. Nhận xét & Đánh giá', level=1)
+    
+    doc.add_heading('Giáo viên chủ nhiệm:', level=2)
+    doc.add_paragraph(review_gv if review_gv else "Chưa có nhận xét.")
+    
+    doc.add_heading('Phụ huynh học sinh:', level=2)
+    doc.add_paragraph(review_ph if review_ph else "Chưa có ý kiến.")
+    
+    # Save to IO
+    bio = io.BytesIO()
+    doc.save(bio)
+    return bio.getvalue()
+
 def change_password_ui(email):
     with st.expander("🔐 Đổi mật khẩu"):
         with st.form("change_pass_form"):
@@ -241,10 +334,8 @@ def get_periods_map(role):
     df = load_data("Periods")
     if df.empty: return {}
     if 'TrangThai' not in df.columns: return {}
-    
     if role != 'Admin':
         df = df[df['TrangThai'] == 'Mo']
-        
     if 'TenDot' in df.columns and 'ID' in df.columns:
         return dict(zip(df['TenDot'], df['ID']))
     return {}
@@ -264,18 +355,15 @@ def login_page():
             if df_users.empty:
                 st.error("Không kết nối được dữ liệu User.")
                 return
-
             df_users['Password'] = df_users['Password'].astype(str)
             user = df_users[(df_users['Email'] == email) & (df_users['Password'] == str(password))]
-            
             if not user.empty:
                 u = user.iloc[0]
-                ten_lop_val = u.get('TenLop', '')
                 st.session_state['user'] = {
                     'email': u['Email'], 
                     'name': u['HoTen'], 
                     'role': u['VaiTro'], 
-                    'ten_lop': ten_lop_val
+                    'ten_lop': u.get('TenLop', '')
                 }
                 st.rerun()
             else:
@@ -297,31 +385,24 @@ def admin_dashboard(period_id):
             stats_data = []
             reviews = load_data("FinalReviews")
             all_users = load_data("Users")
-            
             for _, cl in classes.iterrows():
                 siso = float(cl.get('SiSo', 0))
                 ten_lop = cl.get('TenLop', 'N/A')
                 gvcn = cl.get('EmailGVCN', 'N/A')
-                
                 class_users = []
                 if not all_users.empty and 'TenLop' in all_users.columns:
                     class_users = all_users[all_users['TenLop'] == ten_lop]['Email'].tolist()
                 
+                approved_count = 0
                 if not reviews.empty and class_users:
                     approved_count = reviews[
                         (reviews['ID_Dot'] == period_id) & 
                         (reviews['Email_HocSinh'].isin(class_users)) & 
                         (reviews['NhanXet_GV'] != "")
                     ].shape[0]
-                else:
-                    approved_count = 0
-
                 pct_approved = round((approved_count / siso * 100), 1) if siso > 0 else 0
-                
                 stats_data.append({
-                    "Tên Lớp": ten_lop,
-                    "GVCN": gvcn,
-                    "Sĩ Số": int(siso),
+                    "Tên Lớp": ten_lop, "GVCN": gvcn, "Sĩ Số": int(siso),
                     "Đã Duyệt Tổng Kết (%)": f"{pct_approved}%",
                     "Chưa Duyệt (%)": f"{100 - pct_approved}%"
                 })
@@ -347,8 +428,7 @@ def admin_dashboard(period_id):
                                     add_record("Users", [c_gv, "123", f"GV ({c_name})", "GiaoVien", ""])
                                 st.success(f"Đã tạo lớp {c_name}!")
                                 st.rerun()
-                        except Exception as e:
-                            st.error(f"Lỗi: {e}")
+                        except Exception as e: st.error(f"Lỗi: {e}")
 
         with col_b:
             st.write("###### Danh sách kích hoạt")
@@ -383,7 +463,6 @@ def admin_dashboard(period_id):
                 is_open = row.get('TrangThai') == 'Mo'
                 p_id = row.get('ID')
                 p_name = row.get('TenDot', 'Unknown')
-                
                 toggle = st.toggle(f"{p_name} (ID: {p_id})", value=is_open, key=f"p_{p_id}")
                 new_st = 'Mo' if toggle else 'Khoa'
                 if new_st != row.get('TrangThai'):
@@ -394,7 +473,6 @@ def admin_dashboard(period_id):
                     delete_record("Periods", "ID", p_id)
                     st.warning(f"Đã xóa đợt: {p_name}")
                     st.rerun()
-        
         with st.form("new_period"):
             p_name = st.text_input("Tên đợt mới")
             if st.form_submit_button("Thêm"):
@@ -412,60 +490,81 @@ def teacher_dashboard(period_id):
     if classes.empty:
         st.warning("Dữ liệu lớp học trống.")
         return
-
     my_class = classes[classes['EmailGVCN'] == user_email]
-    
     if my_class.empty:
         st.warning("Bạn chưa được phân công lớp.")
         return
-
     class_name = my_class.iloc[0]['TenLop']
     st.info(f"Lớp: {class_name} - Đợt làm việc ID: {period_id}")
 
-    tab1, tab2 = st.tabs(["Danh sách Học sinh (List View)", "Import Excel"])
+    # Load data for tabs
+    users = load_data("Users")
+    all_okrs = load_data("OKRs")
+    all_reviews = load_data("FinalReviews")
+    
+    students = pd.DataFrame()
+    if 'TenLop' in users.columns:
+        students = users[users['TenLop'] == class_name]
+
+    # --- DASHBOARD METRICS (TÍNH NĂNG MỚI) ---
+    if not students.empty:
+        total_hs = len(students)
+        submitted = 0
+        ranks = {'Tốt': 0, 'Khá': 0, 'Đạt': 0, 'Chưa đạt': 0}
+        
+        for _, hs in students.iterrows():
+            if not all_okrs.empty:
+                hs_okrs = all_okrs[(all_okrs['Email_HocSinh'] == hs['Email']) & (all_okrs['ID_Dot'] == period_id)]
+            else:
+                hs_okrs = pd.DataFrame()
+            
+            if not hs_okrs.empty:
+                submitted += 1
+                # Calculate Rank
+                total_pct = 0
+                for _, r in hs_okrs.iterrows():
+                    total_pct += calculate_percent(r['ActualValue'], r['TargetValue'])
+                avg = total_pct / len(hs_okrs) if len(hs_okrs) > 0 else 0
+                r_txt, _ = get_rank(avg)
+                ranks[r_txt] += 1
+        
+        # Metrics Display
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Tổng HS", total_hs)
+        m2.metric("Đã nhập OKR", f"{submitted}/{total_hs}")
+        m3.metric("Tỉ lệ nộp", f"{round(submitted/total_hs*100, 1) if total_hs else 0}%")
+        
+        # Chart
+        with m4:
+            if submitted > 0:
+                fig, ax = plt.subplots(figsize=(2, 2))
+                ax.pie(list(ranks.values()), labels=list(ranks.keys()), autopct='%1.0f%%', textprops={'fontsize': 6})
+                st.pyplot(fig)
+    st.divider()
+
+    tab1, tab2 = st.tabs(["Danh sách & Duyệt OKR", "Quản lý Lớp (Import/Sửa/Xóa)"])
 
     with tab1:
         st.subheader("📋 Trạng thái OKR Học sinh")
-        
-        users = load_data("Users")
-        students = pd.DataFrame()
-        if 'TenLop' in users.columns:
-            students = users[users['TenLop'] == class_name]
-        
         if students.empty:
             st.write("Lớp chưa có học sinh.")
         else:
             cols = st.columns([0.5, 2, 1.5, 1.5, 1])
             cols[0].markdown("**STT**")
             cols[1].markdown("**Họ Tên**")
-            cols[2].markdown("**Duyệt Lần 1 (Mục Tiêu)**")
-            cols[3].markdown("**Duyệt Lần 2 (Tổng Kết)**")
+            cols[2].markdown("**Duyệt Lần 1**")
+            cols[3].markdown("**Duyệt Lần 2**")
             cols[4].markdown("**Hành động**")
             
-            all_okrs = load_data("OKRs")
-            all_reviews = load_data("FinalReviews")
-
             for idx, hs in students.iterrows():
-                if not all_okrs.empty:
-                    hs_okrs = all_okrs[(all_okrs['Email_HocSinh'] == hs['Email']) & (all_okrs['ID_Dot'] == period_id)]
-                else:
-                    hs_okrs = pd.DataFrame()
-
-                # Status L1
-                l1_status = ""
-                l1_badge = ""
+                hs_okrs = all_okrs[(all_okrs['Email_HocSinh'] == hs['Email']) & (all_okrs['ID_Dot'] == period_id)] if not all_okrs.empty else pd.DataFrame()
                 
+                # Status L1
                 if hs_okrs.empty:
-                    l1_status = "Chưa tạo"
-                    l1_badge = "badge-red"
+                    l1_status, l1_badge = "Chưa tạo", "badge-red"
                 else:
                     pending = hs_okrs[hs_okrs['TrangThai'] == 'ChoDuyet']
-                    if not pending.empty:
-                        l1_status = "Chờ duyệt"
-                        l1_badge = "badge-yellow"
-                    else:
-                        l1_status = "Đã duyệt"
-                        l1_badge = "badge-green"
+                    l1_status, l1_badge = ("Chờ duyệt", "badge-yellow") if not pending.empty else ("Đã duyệt", "badge-green")
 
                 # Status L2
                 has_final = False
@@ -473,24 +572,16 @@ def teacher_dashboard(period_id):
                     rev = all_reviews[(all_reviews['Email_HocSinh'] == hs['Email']) & (all_reviews['ID_Dot'] == period_id)]
                     if not rev.empty and rev.iloc[0]['NhanXet_GV'] != "":
                         has_final = True
+                l2_status, l2_badge = ("Đã xong", "badge-green") if has_final else ("Chưa xong", "badge-grey")
                 
-                l2_status = "Đã xong" if has_final else "Chưa xong"
-                l2_badge = "badge-green" if has_final else "badge-grey"
-                
-                has_del_req = False
-                if not hs_okrs.empty:
-                    if not hs_okrs[hs_okrs['DeleteRequest'] == 1].empty:
-                        has_del_req = True
+                # Del Req
+                has_del_req = not hs_okrs[hs_okrs['DeleteRequest'] == 1].empty if not hs_okrs.empty else False
                 
                 with st.container():
                     c = st.columns([0.5, 2, 1.5, 1.5, 1])
                     c[0].write(f"{idx+1}")
-                    
-                    name_display = hs['HoTen']
-                    if has_del_req:
-                        name_display += " ⚠️ (Có yêu cầu xóa)"
+                    name_display = hs['HoTen'] + (" ⚠️ (Xóa?)" if has_del_req else "")
                     c[1].write(name_display)
-                    
                     c[2].markdown(f'<span class="status-badge {l1_badge}">{l1_status}</span>', unsafe_allow_html=True)
                     c[3].markdown(f'<span class="status-badge {l2_badge}">{l2_status}</span>', unsafe_allow_html=True)
                     
@@ -500,114 +591,162 @@ def teacher_dashboard(period_id):
 
             st.divider()
             
+            # --- VIEW CHI TIẾT ---
             if 'selected_hs' in st.session_state:
                 hs_curr = st.session_state['selected_hs']
                 st.markdown(f"### 📝 Chi tiết: {hs_curr['HoTen']}")
                 
-                if not all_okrs.empty:
-                    df_okr = all_okrs[(all_okrs['Email_HocSinh'] == hs_curr['Email']) & (all_okrs['ID_Dot'] == period_id)]
-                else:
-                    df_okr = pd.DataFrame()
+                # WORD EXPORT BUTTON
+                docx_data = None
+                df_okr = all_okrs[(all_okrs['Email_HocSinh'] == hs_curr['Email']) & (all_okrs['ID_Dot'] == period_id)] if not all_okrs.empty else pd.DataFrame()
                 
+                # Get reviews for docx
+                rev_gv_txt = ""
+                rev_ph_txt = ""
+                if not all_reviews.empty:
+                    rev_row = all_reviews[(all_reviews['Email_HocSinh'] == hs_curr['Email']) & (all_reviews['ID_Dot'] == period_id)]
+                    if not rev_row.empty:
+                        rev_gv_txt = rev_row.iloc[0]['NhanXet_GV']
+                        rev_ph_txt = rev_row.iloc[0]['NhanXet_PH']
+
+                docx_bytes = create_docx(hs_curr['HoTen'], class_name, f"Đợt {period_id}", df_okr, rev_gv_txt, rev_ph_txt)
+                st.download_button(label="📥 Tải Báo cáo Word", data=docx_bytes, file_name=f"BaoCao_{hs_curr['HoTen']}.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
                 if df_okr.empty:
                     st.warning("Học sinh này chưa nhập OKR nào.")
                 else:
                     for i, row in df_okr.iterrows():
                         with st.container(border=True):
                             c1, c2, c3 = st.columns([4, 2, 2])
-                            
+                            if row['DeleteRequest'] == 1:
+                                st.error(f"⚠️ Học sinh yêu cầu xóa mục tiêu: {row['MucTieu']}")
                             c1.markdown(f"**O:** {row['MucTieu']}")
                             c1.text(f"KR: {row['KetQuaThenChot']}")
                             c2.metric("Mục tiêu/Đạt", f"{row['TargetValue']} / {row['ActualValue']} {row['Unit']}")
                             pct = calculate_percent(row['ActualValue'], row['TargetValue'])
                             c2.progress(min(pct/100, 1.0))
-                            
                             with c3:
                                 st.write(f"TT: {row['TrangThai']}")
-                                
-                                # Teacher Approve L1
                                 if row['TrangThai'] == 'ChoDuyet':
-                                    if st.button("✅ Duyệt Mục Tiêu", key=f"app_{row['ID']}"):
+                                    if st.button("✅ Duyệt", key=f"app_{row['ID']}"):
                                         update_record("OKRs", "ID", row['ID'], "TrangThai", "DaDuyetMucTieu")
                                         st.rerun()
-                                
-                                # Teacher Approve Delete
                                 if row['DeleteRequest'] == 1:
-                                    st.error("⚠️ Học sinh xin xóa!")
-                                    if st.button("🗑️ Chấp thuận xóa", key=f"del_{row['ID']}"):
+                                    if st.button("🗑️ Xóa", key=f"del_{row['ID']}"):
                                         delete_record("OKRs", "ID", row['ID'])
                                         st.rerun()
 
                     st.write("---")
-                    old_cmt_gv = ""
-                    cmt_ph = None
-                    if not all_reviews.empty:
-                        rev = all_reviews[(all_reviews['Email_HocSinh'] == hs_curr['Email']) & (all_reviews['ID_Dot'] == period_id)]
-                        if not rev.empty:
-                            old_cmt_gv = rev.iloc[0]['NhanXet_GV']
-                            if rev.iloc[0]['NhanXet_PH']:
-                                cmt_ph = rev.iloc[0]['NhanXet_PH']
-                    
-                    if cmt_ph:
-                        st.info(f"🏠 **Ý kiến gia đình:** {cmt_ph}")
-                    else:
-                        st.caption("🏠 Gia đình chưa gửi ý kiến.")
+                    if rev_ph_txt: st.info(f"🏠 **Ý kiến gia đình:** {rev_ph_txt}")
+                    else: st.caption("🏠 Gia đình chưa gửi ý kiến.")
 
                     st.write("**Đánh giá cuối kỳ (Final Review):**")
                     with st.form("teacher_review"):
-                        cmt = st.text_area("Nhận xét giáo viên:", value=old_cmt_gv)
-                        if st.form_submit_button("Lưu & Hoàn tất Duyệt Lần 2"):
+                        cmt = st.text_area("Nhận xét giáo viên:", value=rev_gv_txt)
+                        if st.form_submit_button("Lưu & Hoàn tất"):
                             upsert_final_review(hs_curr['Email'], period_id, "NhanXet_GV", cmt)
                             st.success("Đã lưu nhận xét!")
 
+    # --- TAB 2: QUẢN LÝ HỌC SINH (SỬA/XÓA/IMPORT) ---
     with tab2:
-        st.subheader("Import Excel")
-        st.caption("Cột bắt buộc: Email, HoTen, EmailPH")
-        upl = st.file_uploader("Upload Excel", type=['xlsx'])
-        if upl:
-            try:
-                df = pd.read_excel(upl)
-                count = 0
-                all_users = load_data("Users")
-                all_rels = load_data("Relationships")
-                
-                for _, r in df.iterrows():
-                    if all_users.empty or r['Email'] not in all_users['Email'].values:
-                         add_record("Users", [r['Email'], '123', r['HoTen'], 'HocSinh', class_name])
+        st.subheader("Quản lý Danh sách Học sinh")
+        
+        # 1. IMPORT EXCEL (BATCH)
+        with st.expander("📥 Import danh sách từ Excel (Tối ưu hóa)"):
+            st.caption("File Excel cần các cột: 'Email', 'HoTen', 'EmailPH'. Hệ thống sẽ tự động bỏ qua Email đã tồn tại.")
+            upl = st.file_uploader("Upload Excel", type=['xlsx'])
+            if upl:
+                try:
+                    df_upload = pd.read_excel(upl)
+                    
+                    # Chuẩn bị dữ liệu Batch
+                    users_to_add = []
+                    rels_to_add = []
+                    
+                    # Load existing data to check duplicates (In Memory)
+                    existing_users = set(users['Email'].tolist()) if not users.empty else set()
+                    
+                    # Check Relationships
+                    existing_rels = set()
+                    all_rels = load_data("Relationships")
+                    if not all_rels.empty:
+                        for _, r in all_rels.iterrows():
+                            existing_rels.add(f"{r['Email_HocSinh']}_{r['Email_PhuHuynh']}")
 
-                    if pd.notna(r['EmailPH']):
-                        ph_email = str(r['EmailPH'])
-                        if all_users.empty or ph_email not in all_users['Email'].values:
-                            add_record("Users", [ph_email, '123', 'Phụ Huynh', 'PhuHuynh', ''])
+                    count_added = 0
+                    for _, r in df_upload.iterrows():
+                        hs_email = str(r['Email']).strip()
+                        hs_name = str(r['HoTen']).strip()
                         
-                        rel_exists = False
-                        if not all_rels.empty:
-                            mask = (all_rels['Email_HocSinh'] == r['Email']) & (all_rels['Email_PhuHuynh'] == ph_email)
-                            if not all_rels[mask].empty:
-                                rel_exists = True
+                        # Add HS if not exists
+                        if hs_email not in existing_users:
+                            users_to_add.append([hs_email, '123', hs_name, 'HocSinh', class_name])
+                            existing_users.add(hs_email) # Update set to avoid dups within file
+                            count_added += 1
                         
-                        if not rel_exists:
-                            add_record("Relationships", [r['Email'], ph_email])
+                        # Add PH if exists
+                        if 'EmailPH' in r and pd.notna(r['EmailPH']):
+                            ph_email = str(r['EmailPH']).strip()
+                            if ph_email not in existing_users:
+                                users_to_add.append([ph_email, '123', 'Phụ Huynh', 'PhuHuynh', ''])
+                                existing_users.add(ph_email)
+                            
+                            # Add Relationship
+                            rel_key = f"{hs_email}_{ph_email}"
+                            if rel_key not in existing_rels:
+                                rels_to_add.append([hs_email, ph_email])
+                                existing_rels.add(rel_key)
 
-                    count += 1
-                st.success(f"Đã import {count} dòng.")
-            except Exception as e:
-                st.error(str(e))
+                    # Batch Insert
+                    if users_to_add:
+                        batch_add_records("Users", users_to_add)
+                    if rels_to_add:
+                        batch_add_records("Relationships", rels_to_add)
+                        
+                    st.success(f"Đã thêm mới {count_added} học sinh thành công!")
+                    
+                except Exception as e:
+                    st.error(f"Lỗi xử lý file: {e}")
+
+        st.divider()
+        # 2. DANH SÁCH & EDIT/DELETE
+        st.write("###### Danh sách hiện tại (Có thể Sửa/Xóa)")
+        if not students.empty:
+            for idx, hs in students.iterrows():
+                with st.expander(f"{idx+1}. {hs['HoTen']} ({hs['Email']})"):
+                    with st.form(f"edit_user_{idx}"):
+                        c1, c2 = st.columns(2)
+                        new_name = c1.text_input("Tên", value=hs['HoTen'])
+                        new_pass = c2.text_input("Mật khẩu", value=hs['Password'])
+                        
+                        col_btn1, col_btn2 = st.columns(2)
+                        if col_btn1.form_submit_button("Lưu thay đổi"):
+                            update_record("Users", "Email", hs['Email'], "HoTen", new_name)
+                            update_record("Users", "Email", hs['Email'], "Password", new_pass)
+                            st.success("Đã cập nhật!")
+                            st.rerun()
+                            
+                    if st.button("🗑️ Xóa Học sinh này", key=f"del_user_{idx}"):
+                        delete_record("Users", "Email", hs['Email'])
+                        st.warning("Đã xóa!")
+                        st.rerun()
 
 # --- 3. STUDENT DASHBOARD ---
 def student_dashboard(period_id):
     user_email = st.session_state['user']['email']
-    st.header(f"🎒 Góc Học Tập: {st.session_state['user']['name']}")
+    user_name = st.session_state['user']['name']
+    
+    st.header(f"🎒 Góc Học Tập: {user_name}")
     change_password_ui(user_email)
     
     with st.expander("➕ Thêm Mục tiêu & Kết quả (OKR)", expanded=True):
         with st.form("student_add"):
             st.caption("Nhập nhiều KR cho cùng 1 Mục tiêu bằng cách gõ lại tên Mục tiêu.")
-            mt = st.text_input("Mục tiêu (Objective) - VD: Học sinh giỏi", placeholder="Nhập tên mục tiêu lớn...")
-            kr = st.text_input("Kết quả then chốt (KR) - VD: Toán > 8.0")
+            mt = st.text_input("Mục tiêu (Objective)", placeholder="Nhập tên mục tiêu lớn...")
+            kr = st.text_input("Kết quả then chốt (KR)", placeholder="Ví dụ: Toán > 8.0")
             c1, c2 = st.columns(2)
-            target = c1.number_input("Con số mục tiêu (Target)", min_value=0.1)
-            unit = c2.text_input("Đơn vị (VD: Điểm, Bài...)", value="Điểm")
+            target = c1.number_input("Target", min_value=0.1)
+            unit = c2.text_input("Đơn vị", value="Điểm")
             
             if st.form_submit_button("Lưu OKR"):
                 if mt and kr:
@@ -617,14 +756,28 @@ def student_dashboard(period_id):
                     st.rerun()
 
     st.divider()
-    st.subheader("📋 OKR của tôi")
     
+    # Download Word Report for Student
     all_okrs = load_data("OKRs")
-    if not all_okrs.empty:
-        df_okrs = all_okrs[(all_okrs['Email_HocSinh'] == user_email) & (all_okrs['ID_Dot'] == period_id)]
-    else:
-        df_okrs = pd.DataFrame()
+    df_okrs = all_okrs[(all_okrs['Email_HocSinh'] == user_email) & (all_okrs['ID_Dot'] == period_id)] if not all_okrs.empty else pd.DataFrame()
     
+    all_reviews = load_data("FinalReviews")
+    rev_gv_txt = ""
+    rev_ph_txt = ""
+    if not all_reviews.empty:
+        rev_row = all_reviews[(all_reviews['Email_HocSinh'] == user_email) & (all_reviews['ID_Dot'] == period_id)]
+        if not rev_row.empty:
+            rev_gv_txt = rev_row.iloc[0]['NhanXet_GV']
+            rev_ph_txt = rev_row.iloc[0]['NhanXet_PH']
+
+    # Get Class Name for Report
+    users = load_data("Users")
+    my_class = users[users['Email'] == user_email].iloc[0]['TenLop'] if not users.empty else ""
+
+    docx_bytes = create_docx(user_name, my_class, f"Đợt {period_id}", df_okrs, rev_gv_txt, rev_ph_txt)
+    st.download_button(label="📥 Tải Báo cáo Cá nhân (Word)", data=docx_bytes, file_name=f"BaoCao_{user_name}.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+    st.subheader("📋 OKR của tôi")
     if df_okrs.empty:
         st.info("Chưa có dữ liệu.")
     else:
@@ -660,45 +813,30 @@ def student_dashboard(period_id):
                                     st.rerun()
                     
                     with c4:
-                        # Logic Xóa cho HS
                         if row['TrangThai'] == 'ChoDuyet':
-                            # Chưa duyệt -> Xóa thoải mái
                             if st.button("🗑️ Xóa ngay", key=f"del_{row['ID']}"):
                                 delete_record("OKRs", "ID", row['ID'])
                                 st.rerun()
                         else:
-                            # Đã duyệt -> Xin xóa
                             if row['DeleteRequest'] == 0:
                                 if st.button("❌ Xin xóa", key=f"req_{row['ID']}"):
                                     update_record("OKRs", "ID", row['ID'], "DeleteRequest", 1)
                                     st.rerun()
                             else:
-                                st.caption("⏳ Chờ GV duyệt xóa")
+                                st.caption("⏳ Đợi duyệt")
 
         st.divider()
         final_score = round(total_pct / count_kr, 1) if count_kr > 0 else 0
         rank, color = get_rank(final_score)
         st.markdown(f"### 🏁 Tổng kết: <span style='color:{color}'>{final_score}% - {rank}</span>", unsafe_allow_html=True)
         
-        all_reviews = load_data("FinalReviews")
-        fr = pd.DataFrame()
-        if not all_reviews.empty:
-            fr = all_reviews[(all_reviews['Email_HocSinh'] == user_email) & (all_reviews['ID_Dot'] == period_id)]
-        
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("##### 👨‍🏫 Giáo viên nhận xét:")
-            if not fr.empty and fr.iloc[0]['NhanXet_GV']:
-                st.info(fr.iloc[0]['NhanXet_GV'])
-            else:
-                st.caption("Chưa có nhận xét.")
-
+            st.info(rev_gv_txt if rev_gv_txt else "Chưa có nhận xét.")
         with col2:
             st.markdown("##### 🏠 Gia đình nhận xét:")
-            if not fr.empty and fr.iloc[0]['NhanXet_PH']:
-                st.success(fr.iloc[0]['NhanXet_PH'])
-            else:
-                st.caption("Gia đình chưa có ý kiến.")
+            st.success(rev_ph_txt if rev_ph_txt else "Chưa có ý kiến.")
 
 # --- 4. PARENT DASHBOARD ---
 def parent_dashboard(period_id):
@@ -752,10 +890,9 @@ def parent_dashboard(period_id):
         
         with col1:
             st.write("**Giáo viên:**")
-            if not fr.empty and fr.iloc[0]['NhanXet_GV']:
-                st.info(fr.iloc[0]['NhanXet_GV'])
-            else:
-                st.text("Chưa có nhận xét.")
+            gv_txt = fr.iloc[0]['NhanXet_GV'] if not fr.empty else ""
+            if gv_txt: st.info(gv_txt)
+            else: st.text("Chưa có nhận xét.")
                 
         with col2:
             st.write("**Gia đình:**")
@@ -780,23 +917,18 @@ def main():
         login_page()
     else:
         role = st.session_state['user']['role']
-        
         with st.sidebar:
             st.markdown(f"### 👤 {st.session_state['user']['name']}")
             st.caption(f"Vai trò: {role}")
-            
             st.divider()
             st.write("📅 **Chọn Đợt (Học kỳ):**")
-            
             periods_map = get_periods_map(role)
-            
             if periods_map:
                 selected_period_name = st.selectbox("Danh sách đợt:", list(periods_map.keys()))
                 selected_period_id = periods_map[selected_period_name]
             else:
                 st.warning("Chưa có Đợt nào khả dụng.")
                 selected_period_id = None
-            
             st.divider()
             if st.button("Đăng xuất"):
                 for key in list(st.session_state.keys()):
@@ -809,10 +941,8 @@ def main():
             elif role == 'HocSinh': student_dashboard(selected_period_id)
             elif role == 'PhuHuynh': parent_dashboard(selected_period_id)
         else:
-            if role == 'Admin':
-                admin_dashboard(0)
-            else:
-                st.info("Hiện không có đợt nhập liệu nào đang mở.")
+            if role == 'Admin': admin_dashboard(0)
+            else: st.info("Hiện không có đợt nhập liệu nào đang mở.")
 
 if __name__ == "__main__":
     main()
