@@ -4,4 +4,5 @@ gspread
 oauth2client
 openpyxl
 python-docx
+fpdf
 matplotlib
