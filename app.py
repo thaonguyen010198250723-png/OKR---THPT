@@ -4,13 +4,12 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
 import unicodedata
-from fpdf import FPDF
 import time
-from docx import Document
+import matplotlib.pyplot as plt # Dùng để vẽ biểu đồ
+from docx import Document       # Dùng để xuất file Word
 from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-import io
-import matplotlib.pyplot as plt
+import io                       # Dùng để xử lý file trong bộ nhớ
 
 # ==============================================================================
 # CẤU HÌNH TRANG & GIAO DIỆN
