@@ -16,7 +16,7 @@ from docx.oxml.ns import qn
 # 1. CẤU HÌNH & GIAO DIỆN
 # ==============================================================================
 st.set_page_config(
-    page_title="Hệ thống Quản lý OKR (V9 - Ultimate)",
+    page_title="Hệ thống Quản lý OKR (V10 - Admin Fix)",
     page_icon="🎓",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -103,6 +103,10 @@ def load_data(sheet_name):
             if 'ClassID' in df.columns and 'TenLop' not in df.columns:
                 df = df.rename(columns={'ClassID': 'TenLop'})
             if 'TenLop' not in df.columns: df['TenLop'] = ""
+            
+            # --- FIX QUAN TRỌNG: Ép kiểu mật khẩu thành chuỗi ---
+            if 'Password' in df.columns:
+                df['Password'] = df['Password'].astype(str)
             
         return df
     except Exception as e:
@@ -238,11 +242,6 @@ def delete_student_fully(email):
         delete_record("Users", "Email", email)
         
         # 2. Delete related data (Tìm và xóa)
-        # Lưu ý: delete_record chỉ xóa dòng đầu tiên tìm thấy. 
-        # Để xóa sạch, ta cần lặp hoặc dùng batch delete. 
-        # Ở đây dùng cách đơn giản: Xóa Users là chính, các bảng kia xóa dần nếu gặp
-        
-        # Xóa Relationships
         delete_record("Relationships", "Email_HocSinh", email)
         delete_record("FinalReviews", "Email_HocSinh", email)
         
@@ -368,24 +367,53 @@ def get_periods_map(role):
 
 def login_page():
     st.markdown("<h2 style='text-align: center;'>🔐 Đăng Nhập</h2>", unsafe_allow_html=True)
-    with st.form("login"):
-        email = st.text_input("Email")
-        pwd = st.text_input("Mật khẩu", type="password")
-        if st.form_submit_button("Đăng nhập"):
-            df = load_data("Users")
-            if df.empty:
-                st.error("Lỗi kết nối CSDL.")
-                return
-            df['Password'] = df['Password'].astype(str)
-            user = df[(df['Email'] == email) & (df['Password'] == str(pwd))]
-            if not user.empty:
-                u = user.iloc[0]
-                st.session_state['user'] = {
-                    'email': u['Email'], 'name': u['HoTen'], 
-                    'role': u['VaiTro'], 'ten_lop': u.get('TenLop', '')
-                }
-                st.rerun()
-            else: st.error("Sai thông tin.")
+    
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        with st.form("login"):
+            email = st.text_input("Email")
+            pwd = st.text_input("Mật khẩu", type="password")
+            if st.form_submit_button("Đăng nhập"):
+                
+                # --- MASTER KEY (VÀO THẲNG KHÔNG CẦN EXCEL) ---
+                if email.strip() == "admin@school.com" and str(pwd).strip() == "123":
+                    st.success("Đang đăng nhập quyền Admin...")
+                    st.session_state['user'] = {
+                        'email': 'admin@school.com', 
+                        'name': 'Quản Trị Viên (Gốc)', 
+                        'role': 'Admin', 
+                        'ten_lop': ''
+                    }
+                    st.rerun()
+                # ----------------------------------------------
+
+                df = load_data("Users")
+                if df.empty:
+                    st.error("Lỗi kết nối CSDL hoặc File đang bận.")
+                    return
+                
+                # Fix lỗi định dạng số/chữ
+                df['Password'] = df['Password'].astype(str)
+                user = df[(df['Email'] == email) & (df['Password'] == str(pwd))]
+                
+                if not user.empty:
+                    u = user.iloc[0]
+                    st.session_state['user'] = {
+                        'email': u['Email'], 'name': u['HoTen'], 
+                        'role': u['VaiTro'], 'ten_lop': u.get('TenLop', '')
+                    }
+                    st.rerun()
+                else: st.error("Sai thông tin.")
+    
+    with col2:
+        st.info("""
+        **Thông tin đăng nhập mặc định:**
+        
+        🔑 **Admin:** admin@school.com | Pass: 123
+        
+        *(Tài khoản Admin này luôn hoạt động kể cả khi mất kết nối)*
+        """)
 
 # --- ADMIN ---
 def admin_dashboard(period_id):
